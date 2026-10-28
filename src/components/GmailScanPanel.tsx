@@ -8,18 +8,19 @@ type ScanEvent=Record<string,unknown>;
 type ReviewItem={id:string;filename:string;mimeType:string;from:string;subject:string;receivedAt:string;messageId:string;reason:string};
 const initialStats:ScanStats={phase:'idle',emailsScanned:0,totalEmailsEstimate:null,documentsFound:0,documentsParsed:0,documentsFailed:0,failedEmails:0,skippedAttachments:0,currentFile:''};
 function dateValue(date:Date){return`${date.getFullYear()}-${String(date.getMonth()+1).padStart(2,'0')}-${String(date.getDate()).padStart(2,'0')}`;}
+function waitForRetry(milliseconds:number,signal:AbortSignal){return new Promise<void>((resolve,reject)=>{if(signal.aborted){reject(new DOMException('The scan was cancelled.','AbortError'));return;}const finish=()=>{signal.removeEventListener('abort',cancel);resolve();};const timer=window.setTimeout(finish,milliseconds);const cancel=()=>{window.clearTimeout(timer);signal.removeEventListener('abort',cancel);reject(new DOMException('The scan was cancelled.','AbortError'));};signal.addEventListener('abort',cancel,{once:true});});}
 export default function GmailScanPanel({onFiles,onScanStateChange}:{onFiles:(files:File[])=>Promise<ParseResult>;onScanStateChange?:(scanning:boolean)=>void}){const now=new Date(),[startDate,setStartDate]=useState(`${now.getFullYear()}-01-01`),[endDate,setEndDate]=useState(dateValue(now)),[connected,setConnected]=useState(false),[email,setEmail]=useState<string|null>(null),[loading,setLoading]=useState(false),[message,setMessage]=useState(''),[stats,setStats]=useState<ScanStats>(initialStats),[reviewItems,setReviewItems]=useState<ReviewItem[]>([]),[reviewOpen,setReviewOpen]=useState(false),abortRef=useRef<AbortController|null>(null);
  useEffect(()=>{void fetch('/api/gmail/status').then(r=>r.json()).then(d=>{setConnected(Boolean(d.connected));setEmail(d.email??null)}).catch(()=>{});const params=new URLSearchParams(window.location.search);const state=params.get('gmail'),setupMessage=params.get('message');if(state){params.delete('gmail');params.delete('message');history.replaceState(null,'',`${window.location.pathname}${params.size?`?${params}`:''}`);const messages:Record<string,string>={setup_required:setupMessage||'Add Google OAuth settings to .env.local to connect Gmail.',connected:'Gmail is connected and ready to scan.',denied:'Gmail access was cancelled.',failed:'Gmail could not finish connecting. Check the OAuth redirect URI and mailbox permissions.',state_error:'The OAuth session expired. Please connect again.'};window.setTimeout(()=>setMessage(messages[state]??''),0);}},[]);
  async function scan(){
   const controller=new AbortController();abortRef.current=controller;setLoading(true);onScanStateChange?.(true);setReviewItems([]);setReviewOpen(false);setMessage('Connecting to Gmail…');setStats({...initialStats,phase:'scanning'});
   const totals={emailsScanned:0,totalEmailsEstimate:null as number|null,documentsFound:0,documentsParsed:0,documentsFailed:0,failedEmails:0,skippedAttachments:0};
-  let pageToken:string|undefined,complete=false;
+  let pageToken:string|undefined,complete=false,quotaRetryCount=0;
   try{
    while(!complete&&!controller.signal.aborted){
     const response=await fetch('/api/gmail/scan',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({startDate,endDate,pageToken,totals}),signal:controller.signal});
     if(!response.ok){const error=await response.json() as {error?:string};throw new Error(error.error??'Could not scan Gmail.');}
     if(!response.body)throw new Error('This browser cannot receive live scan progress.');
-    const reader=response.body.getReader(),decoder=new TextDecoder();let buffer='',terminalEvent=false,batchError:string|undefined;
+    const reader=response.body.getReader(),decoder=new TextDecoder();let buffer='',terminalEvent=false,batchError:string|undefined,shouldRetryQuota=false;
     const updateFromEvent=(event:ScanEvent)=>{
      for(const key of ['emailsScanned','documentsFound','failedEmails','skippedAttachments'] as const){const value=Number(event[key]);if(Number.isFinite(value))totals[key]=value;}
      const estimate=Number(event.totalEmailsEstimate);if(Number.isFinite(estimate))totals.totalEmailsEstimate=estimate;
@@ -40,7 +41,7 @@ export default function GmailScanPanel({onFiles,onScanStateChange}:{onFiles:(fil
      if(name==='email_failed'){
       updateFromEvent(event);
       const messageId=String(event.messageId??'');
-      setReviewItems(items=>[...items,{id:`${messageId}:email-failed`,filename:'Email could not be read',mimeType:'',from:'',subject:'',receivedAt:'',messageId,reason:`Gmail could not read this email (HTTP ${String(event.status??'error')}) after retrying.`}]);
+      setReviewItems(items=>[...items,{id:`${messageId}:email-failed`,filename:'Email could not be read',mimeType:'',from:'',subject:'',receivedAt:'',messageId,reason:`Gmail could not read this email (HTTP ${String(event.status??'error')}${event.details?` · ${String(event.details)}`:''}) after retrying.`}]);
      }
      if(name==='attachment'){
       const filename=String(event.filename??'resume'),mimeType=String(event.mimeType??''),encoded=String(event.data??''),normalized=encoded.replace(/-/g,'+').replace(/_/g,'/'),raw=Uint8Array.from(atob(normalized),c=>c.charCodeAt(0));
@@ -54,6 +55,7 @@ export default function GmailScanPanel({onFiles,onScanStateChange}:{onFiles:(fil
      if(name==='batch'){
       updateFromEvent(event);pageToken=typeof event.nextPageToken==='string'?event.nextPageToken:undefined;
       if(!pageToken)batchError='Gmail did not return a continuation token for the next batch.';
+      quotaRetryCount=0;
       terminalEvent=true;
      }
      if(name==='complete'){
@@ -62,12 +64,15 @@ export default function GmailScanPanel({onFiles,onScanStateChange}:{onFiles:(fil
       setStats(s=>({...s,...totals,phase:'complete',currentFile:''}));
      }
      if(name==='error'){
-      updateFromEvent(event);batchError=String(event.message??'Gmail scan failed.');terminalEvent=true;
+      updateFromEvent(event);batchError=String(event.message??'Gmail scan failed.');
+      shouldRetryQuota=/rateLimitExceeded|userRateLimitExceeded|quotaExceeded/i.test(batchError)&&quotaRetryCount<5;
+      terminalEvent=true;
      }
     };
     try{
      while(true){const{value,done}=await reader.read();if(done)break;buffer+=decoder.decode(value,{stream:true});let boundary=buffer.indexOf('\n\n');while(boundary>=0){const block=buffer.slice(0,boundary);buffer=buffer.slice(boundary+2);await handle(block);boundary=buffer.indexOf('\n\n');}}
     }finally{reader.releaseLock();}
+    if(shouldRetryQuota){quotaRetryCount++;const delay=Math.min(5000*2**(quotaRetryCount-1),30000);setMessage(`Gmail is rate-limiting requests. Pausing ${Math.ceil(delay/1000)} seconds, then resuming this batch…`);await waitForRetry(delay,controller.signal);continue;}
     if(batchError)throw new Error(batchError);
     if(!terminalEvent)throw new Error('The Gmail scan batch ended before returning its continuation status.');
    }

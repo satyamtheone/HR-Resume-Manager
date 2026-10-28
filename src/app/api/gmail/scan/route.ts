@@ -18,6 +18,7 @@ type Message = {
 };
 const MAX_ATTACHMENT = 10 * 1024 * 1024;
 const EMAILS_PER_BATCH = 10;
+const TARGET_QUOTA_UNITS_PER_SECOND = 70;
 const encoder = new TextEncoder();
 export const maxDuration = 60;
 
@@ -29,9 +30,38 @@ type ScanTotals = {
   totalEmailsEstimate?: number | null;
 };
 
-async function fetchGmail(url: URL | string, token: string, signal: AbortSignal) {
+function wait(milliseconds: number, signal: AbortSignal) {
+  return new Promise<void>((resolve, reject) => {
+    if (signal.aborted) {
+      reject(new DOMException("The scan was cancelled.", "AbortError"));
+      return;
+    }
+    const finish = () => {
+      signal.removeEventListener("abort", cancel);
+      resolve();
+    };
+    const timer = setTimeout(finish, milliseconds);
+    const cancel = () => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", cancel);
+      reject(new DOMException("The scan was cancelled.", "AbortError"));
+    };
+    signal.addEventListener("abort", cancel, { once: true });
+  });
+}
+
+async function fetchGmail(
+  url: URL | string,
+  token: string,
+  signal: AbortSignal,
+  quotaUnits: number
+) {
   let response: Response | undefined;
-  for (let attempt = 0; attempt < 4; attempt++) {
+  for (let attempt = 0; attempt < 7; attempt++) {
+    await wait(
+      Math.ceil((quotaUnits / TARGET_QUOTA_UNITS_PER_SECOND) * 1000),
+      signal
+    );
     try {
       response = await fetch(url, {
         headers: { authorization: `Bearer ${token}` },
@@ -39,8 +69,8 @@ async function fetchGmail(url: URL | string, token: string, signal: AbortSignal)
         cache: "no-store",
       });
     } catch (error) {
-      if (signal.aborted || attempt === 3) throw error;
-      await new Promise((resolve) => setTimeout(resolve, 300 * 2 ** attempt));
+      if (signal.aborted || attempt === 6) throw error;
+      await wait(Math.min(1000 * 2 ** attempt, 10000), signal);
       continue;
     }
     let gmailRateLimited = false;
@@ -50,22 +80,39 @@ async function fetchGmail(url: URL | string, token: string, signal: AbortSignal)
       } | null;
       gmailRateLimited = Boolean(
         payload?.error?.errors?.some((item) =>
-          ["rateLimitExceeded", "userRateLimitExceeded", "backendError"].includes(
-            item.reason ?? ""
-          )
+          [
+            "rateLimitExceeded",
+            "userRateLimitExceeded",
+            "quotaExceeded",
+            "backendError",
+          ].includes(item.reason ?? "")
         )
       );
     }
     const retryable =
       [429, 500, 502, 503, 504].includes(response.status) || gmailRateLimited;
-    if (!retryable || attempt === 3) return response;
-    const retryAfter = Number(response.headers.get("retry-after"));
-    const delay = Number.isFinite(retryAfter) && retryAfter > 0
-      ? Math.min(retryAfter * 1000, 5000)
-      : 300 * 2 ** attempt;
-    await new Promise((resolve) => setTimeout(resolve, delay));
+    if (!retryable || attempt === 6) return response;
+    const retryAfterHeader = response.headers.get("retry-after");
+    const retryAfterSeconds = Number(retryAfterHeader);
+    const retryAfterDate = retryAfterHeader ? Date.parse(retryAfterHeader) : NaN;
+    const serverDelay = Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0
+      ? retryAfterSeconds * 1000
+      : Number.isFinite(retryAfterDate)
+        ? Math.max(0, retryAfterDate - Date.now())
+        : 0;
+    const backoff = Math.min(1000 * 2 ** attempt, 10000);
+    await wait(Math.min(Math.max(serverDelay, backoff), 30000), signal);
   }
   return response!;
+}
+
+async function gmailErrorDetails(response: Response) {
+  const payload = (await response.clone().json().catch(() => null)) as {
+    error?: { message?: string; errors?: Array<{ reason?: string }> };
+  } | null;
+  const reason = payload?.error?.errors?.[0]?.reason;
+  const message = payload?.error?.message;
+  return [reason, message].filter(Boolean).join(": ") || response.statusText;
 }
 function flatten(part: Part | undefined): Part[] {
   if (!part) return [];
@@ -172,9 +219,18 @@ export async function POST(request: Request) {
             url.searchParams.set("q", query);
             url.searchParams.set("maxResults", String(EMAILS_PER_BATCH));
             if (body.pageToken) url.searchParams.set("pageToken", body.pageToken);
-            const response = await fetchGmail(url, authorized.accessToken, request.signal);
-            if (!response.ok)
-              throw new Error(`Gmail could not search this mailbox (${response.status}).`);
+            const response = await fetchGmail(
+              url,
+              authorized.accessToken,
+              request.signal,
+              5
+            );
+            if (!response.ok) {
+              const details = await gmailErrorDetails(response);
+              throw new Error(
+                `Gmail could not search this mailbox (HTTP ${response.status}${details ? ` · ${details}` : ""}).`
+              );
+            }
             const listing = (await response.json()) as {
               messages?: Array<{ id: string }>;
               resultSizeEstimate?: number;
@@ -196,14 +252,17 @@ export async function POST(request: Request) {
                   item.id
                 )}?format=full`,
                 authorized.accessToken,
-                request.signal
+                request.signal,
+                60
               );
               if (!messageResponse.ok) {
                 failedEmails++;
                 emailsScanned++;
+                const details = await gmailErrorDetails(messageResponse);
                 await emit("email_failed", {
                   messageId: item.id,
                   status: messageResponse.status,
+                  details,
                   failedEmails,
                 });
                 await emit("progress", {
@@ -274,10 +333,14 @@ export async function POST(request: Request) {
                       part.body.attachmentId
                     )}`,
                     authorized.accessToken,
-                    request.signal
+                    request.signal,
+                    20
                   );
                   if (!attachmentResponse.ok) {
-                    await skipAttachment("Gmail could not retrieve this attachment.");
+                    const details = await gmailErrorDetails(attachmentResponse);
+                    await skipAttachment(
+                      `Gmail could not retrieve this attachment (HTTP ${attachmentResponse.status}${details ? ` · ${details}` : ""}).`
+                    );
                     continue;
                   }
                   data = (
