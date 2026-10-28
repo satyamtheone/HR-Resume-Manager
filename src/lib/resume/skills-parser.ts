@@ -1,0 +1,3 @@
+import { SKILLS } from './skills-dictionary';
+const esc=(s:string)=>s.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
+export function parseSkills(text:string):string[]{const found=new Set<string>(); for(const skill of SKILLS){const aliases=skill==='React.js'?['React.js','ReactJS','React']:skill==='Next.js'?['Next.js','NextJS']:skill==='Node.js'?['Node.js','NodeJS']:skill==='Tailwind CSS'?['Tailwind CSS','TailwindCSS']:[skill]; for(const alias of aliases){const re=new RegExp(`(^|[^\\p{L}\\p{N}+#.])${esc(alias)}(?=$|[^\\p{L}\\p{N}+#.])`,'iu');if(re.test(text)){found.add(skill);break;}}} return [...found];}
