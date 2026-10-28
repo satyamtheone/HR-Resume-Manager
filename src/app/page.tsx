@@ -194,7 +194,11 @@ export default function Home() {
   const duplicateGroup =
     groups.find((group) => group.key === duplicateGroupId) ?? null;
   const process = useCallback(
-    async (files: FileList | File[]) => {
+    async (
+      files: FileList | File[],
+      signal?: AbortSignal,
+      timeoutMs?: number | null
+    ) => {
       const list = Array.from(files);
       const existing = [...rows];
       let parsedCount = 0,
@@ -217,7 +221,7 @@ export default function Home() {
           const issue = await validateFile(f);
           if (issue) throw new Error(issue);
           update("Extracting text");
-          const text = await extractText(f);
+          const text = await extractText(f, signal, timeoutMs);
           if (text.replace(/\s/g, "").length < 40)
             throw new Error("No readable resume text found.");
           update("Parsing candidate information");

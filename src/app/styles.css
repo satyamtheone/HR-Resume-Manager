@@ -3573,6 +3573,35 @@ body {
 }
 
 /* Gmail attachments excluded by the parser remain inspectable */
+.retry-large-trigger {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  width: 100%;
+  margin-top: 14px;
+  padding: 13px 15px;
+  border: 1px solid #8998e8;
+  border-radius: 12px;
+  background: linear-gradient(115deg, #eef0ff, #f8f7ff);
+  color: #303b86;
+  text-align: left;
+  box-shadow: 0 8px 20px rgba(65, 74, 164, 0.09);
+  transition: transform 0.18s ease, box-shadow 0.18s ease, border-color 0.18s ease;
+}
+.retry-large-trigger:hover {
+  transform: translateY(-1px);
+  border-color: #6877d4;
+  box-shadow: 0 11px 24px rgba(65, 74, 164, 0.15);
+}
+.retry-large-trigger > span {
+  display: grid;
+  gap: 3px;
+  flex: 1;
+}
+.retry-large-trigger b { font-size: 12px; }
+.retry-large-trigger small { color: #687399; font-size: 10px; }
+.retry-large-trigger > svg:first-child { color: #5664c5; }
+.retry-large-trigger > svg:last-child { color: #8792b0; }
 .review-excluded-trigger {
   display: inline-flex;
   align-items: center;
