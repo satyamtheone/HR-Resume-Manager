@@ -17,7 +17,9 @@ type Message = {
   internalDate?: string;
 };
 const MAX_ATTACHMENT = 10 * 1024 * 1024;
-const EMAILS_PER_BATCH = 10;
+// Keep each serverless invocation short so Vercel can finish a batch before
+// its function deadline, even when a mailbox has many attachments.
+const EMAILS_PER_BATCH = 1;
 const TARGET_QUOTA_UNITS_PER_SECOND = 70;
 const encoder = new TextEncoder();
 export const maxDuration = 60;
@@ -282,6 +284,7 @@ export async function POST(request: Request) {
                   )?.value ?? "";
               emailsScanned++;
               await emit("progress", {
+                messageId: item.id,
                 emailsScanned,
                 totalEmailsEstimate,
                 documentsFound,
