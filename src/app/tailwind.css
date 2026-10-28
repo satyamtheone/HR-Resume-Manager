@@ -1,0 +1,3 @@
+/* Utilities only: keep the existing global/base styles and browser controls intact. */
+@import "tailwindcss/theme.css";
+@import "tailwindcss/utilities.css";

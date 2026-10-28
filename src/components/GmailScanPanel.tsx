@@ -10,18 +10,72 @@ const initialStats:ScanStats={phase:'idle',emailsScanned:0,totalEmailsEstimate:n
 function dateValue(date:Date){return`${date.getFullYear()}-${String(date.getMonth()+1).padStart(2,'0')}-${String(date.getDate()).padStart(2,'0')}`;}
 export default function GmailScanPanel({onFiles,onScanStateChange}:{onFiles:(files:File[])=>Promise<ParseResult>;onScanStateChange?:(scanning:boolean)=>void}){const now=new Date(),[startDate,setStartDate]=useState(`${now.getFullYear()}-01-01`),[endDate,setEndDate]=useState(dateValue(now)),[connected,setConnected]=useState(false),[email,setEmail]=useState<string|null>(null),[loading,setLoading]=useState(false),[message,setMessage]=useState(''),[stats,setStats]=useState<ScanStats>(initialStats),[reviewItems,setReviewItems]=useState<ReviewItem[]>([]),[reviewOpen,setReviewOpen]=useState(false),abortRef=useRef<AbortController|null>(null);
  useEffect(()=>{void fetch('/api/gmail/status').then(r=>r.json()).then(d=>{setConnected(Boolean(d.connected));setEmail(d.email??null)}).catch(()=>{});const params=new URLSearchParams(window.location.search);const state=params.get('gmail'),setupMessage=params.get('message');if(state){params.delete('gmail');params.delete('message');history.replaceState(null,'',`${window.location.pathname}${params.size?`?${params}`:''}`);const messages:Record<string,string>={setup_required:setupMessage||'Add Google OAuth settings to .env.local to connect Gmail.',connected:'Gmail is connected and ready to scan.',denied:'Gmail access was cancelled.',failed:'Gmail could not finish connecting. Check the OAuth redirect URI and mailbox permissions.',state_error:'The OAuth session expired. Please connect again.'};window.setTimeout(()=>setMessage(messages[state]??''),0);}},[]);
- async function scan(){const controller=new AbortController();abortRef.current=controller;setLoading(true);onScanStateChange?.(true);setReviewItems([]);setReviewOpen(false);setMessage('Connecting to Gmail…');setStats({...initialStats,phase:'scanning'});let reader:ReadableStreamDefaultReader<Uint8Array>|null=null;try{const response=await fetch('/api/gmail/scan',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({startDate,endDate}),signal:controller.signal});if(!response.ok){const error=await response.json() as {error?:string};throw new Error(error.error??'Could not scan Gmail.');}if(!response.body)throw new Error('This browser cannot receive live scan progress.');reader=response.body.getReader();const decoder=new TextDecoder();let buffer='';let hasStarted=false;
-  const handle=async(block:string)=>{let name='',data='';for(const line of block.split(/\r?\n/)){if(line.startsWith('event:'))name=line.slice(6).trim();else if(line.startsWith('data:'))data+=line.slice(5).trim();}if(!name||!data)return;const event=JSON.parse(data) as ScanEvent;
-   if(name==='start'){hasStarted=true;const total=Number(event.totalEmailsEstimate??0);setStats(s=>({...s,totalEmailsEstimate:total}));setMessage(`Found about ${total.toLocaleString()} matching emails. Starting the scan…`);}
-   if(name==='progress'){setStats(s=>({...s,emailsScanned:Number(event.emailsScanned??s.emailsScanned),totalEmailsEstimate:Number(event.totalEmailsEstimate??s.totalEmailsEstimate??0),documentsFound:Number(event.documentsFound??s.documentsFound),failedEmails:Number(event.failedEmails??s.failedEmails),skippedAttachments:Number(event.skippedAttachments??s.skippedAttachments)}));}
-   if(name==='skipped'){const item:ReviewItem={id:`${String(event.messageId??'mail')}:${String(event.partId??event.filename??'file')}:${String(event.reason??'skip')}`,filename:String(event.filename??'Unnamed attachment'),mimeType:String(event.mimeType??''),from:String(event.from??''),subject:String(event.subject??''),receivedAt:String(event.receivedAt??''),messageId:String(event.messageId??''),reason:String(event.reason??'Not parsed automatically.')};setReviewItems(items=>[...items,item]);setStats(s=>({...s,skippedAttachments:Number(event.skippedAttachments??s.skippedAttachments+1)}));}
-   if(name==='attachment'){const filename=String(event.filename??'resume'),mimeType=String(event.mimeType??''),encoded=String(event.data??''),normalized=encoded.replace(/-/g,'+').replace(/_/g,'/'),raw=Uint8Array.from(atob(normalized),c=>c.charCodeAt(0));const attachmentFile=new File([raw],filename,{type:mimeType});Object.assign(attachmentFile,{mailSource:{email:String(event.from??''),subject:String(event.subject??''),receivedAt:String(event.receivedAt??'')}});setStats(s=>({...s,documentsFound:Number(event.documentsFound??s.documentsFound+1),currentFile:filename}));setMessage(`Found ${filename}; extracting candidate details…`);const parsed=await onFiles([attachmentFile]);if(parsed.failed){setReviewItems(items=>[...items,{id:`${String(event.messageId??'mail')}:${filename}:parse-failed`,filename,mimeType,from:String(event.from??''),subject:String(event.subject??''),receivedAt:String(event.receivedAt??''),messageId:String(event.messageId??''),reason:parsed.errors?.[0]??'This PDF or DOCX was found, but it did not contain all required candidate details.'}]);}setStats(s=>({...s,documentsParsed:s.documentsParsed+parsed.parsed,documentsFailed:s.documentsFailed+parsed.failed,currentFile:''}));}
-   if(name==='complete'){setStats(s=>({...s,phase:'complete',emailsScanned:Number(event.emailsScanned??s.emailsScanned),totalEmailsEstimate:Number(event.totalEmailsEstimate??s.totalEmailsEstimate??0),documentsFound:Number(event.documentsFound??s.documentsFound),failedEmails:Number(event.failedEmails??s.failedEmails),skippedAttachments:Number(event.skippedAttachments??s.skippedAttachments),currentFile:''}));setMessage(`Scan complete. ${Number(event.documentsFound??0).toLocaleString()} resume documents found; ${Number(event.emailsScanned??0).toLocaleString()} emails checked.`);}
-   if(name==='error'){setStats(s=>({...s,phase:'failed',emailsScanned:Number(event.emailsScanned??s.emailsScanned),documentsFound:Number(event.documentsFound??s.documentsFound),failedEmails:Number(event.failedEmails??s.failedEmails),skippedAttachments:Number(event.skippedAttachments??s.skippedAttachments),currentFile:''}));setMessage(String(event.message??'Gmail scan stopped with an error.'));}
-  };
-  while(true){const{value,done}=await reader.read();if(done)break;buffer+=decoder.decode(value,{stream:true});let boundary=buffer.indexOf('\n\n');while(boundary>=0){const block=buffer.slice(0,boundary);buffer=buffer.slice(boundary+2);await handle(block);boundary=buffer.indexOf('\n\n');}}
-  if(!hasStarted&&stats.phase!=='complete')setMessage('Gmail returned no scan results.');if(!controller.signal.aborted)setStats(s=>s.phase==='scanning'?{...s,phase:'complete',currentFile:''}:s);
- }catch(error){if(controller.signal.aborted){setStats(s=>({...s,phase:'cancelled',currentFile:''}));setMessage('Scan stopped. Profiles already parsed remain in the candidate list.');}else{setStats(s=>({...s,phase:'failed',currentFile:''}));setMessage(error instanceof Error?error.message:'Gmail scan failed.');}}finally{reader?.releaseLock();abortRef.current=null;setLoading(false);onScanStateChange?.(false);}}
+ async function scan(){
+  const controller=new AbortController();abortRef.current=controller;setLoading(true);onScanStateChange?.(true);setReviewItems([]);setReviewOpen(false);setMessage('Connecting to Gmail…');setStats({...initialStats,phase:'scanning'});
+  const totals={emailsScanned:0,totalEmailsEstimate:null as number|null,documentsFound:0,documentsParsed:0,documentsFailed:0,failedEmails:0,skippedAttachments:0};
+  let pageToken:string|undefined,complete=false;
+  try{
+   while(!complete&&!controller.signal.aborted){
+    const response=await fetch('/api/gmail/scan',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({startDate,endDate,pageToken,totals}),signal:controller.signal});
+    if(!response.ok){const error=await response.json() as {error?:string};throw new Error(error.error??'Could not scan Gmail.');}
+    if(!response.body)throw new Error('This browser cannot receive live scan progress.');
+    const reader=response.body.getReader(),decoder=new TextDecoder();let buffer='',terminalEvent=false,batchError:string|undefined;
+    const updateFromEvent=(event:ScanEvent)=>{
+     for(const key of ['emailsScanned','documentsFound','failedEmails','skippedAttachments'] as const){const value=Number(event[key]);if(Number.isFinite(value))totals[key]=value;}
+     const estimate=Number(event.totalEmailsEstimate);if(Number.isFinite(estimate))totals.totalEmailsEstimate=estimate;
+     setStats(s=>({...s,...totals,currentFile:s.currentFile}));
+    };
+    const handle=async(block:string)=>{
+     let name='',data='';for(const line of block.split(/\r?\n/)){if(line.startsWith('event:'))name=line.slice(6).trim();else if(line.startsWith('data:'))data+=line.slice(5).trim();}
+     if(!name||!data)return;const event=JSON.parse(data) as ScanEvent;
+     if(name==='start'){
+      updateFromEvent(event);
+      if(totals.emailsScanned===0)setMessage(`Found about ${(totals.totalEmailsEstimate??0).toLocaleString()} matching emails. Starting the scan…`);
+     }
+     if(name==='progress')updateFromEvent(event);
+     if(name==='skipped'){
+      const item:ReviewItem={id:`${String(event.messageId??'mail')}:${String(event.partId??event.filename??'file')}:${String(event.reason??'skip')}`,filename:String(event.filename??'Unnamed attachment'),mimeType:String(event.mimeType??''),from:String(event.from??''),subject:String(event.subject??''),receivedAt:String(event.receivedAt??''),messageId:String(event.messageId??''),reason:String(event.reason??'Not parsed automatically.')};
+      setReviewItems(items=>[...items,item]);updateFromEvent(event);
+     }
+     if(name==='email_failed'){
+      updateFromEvent(event);
+      const messageId=String(event.messageId??'');
+      setReviewItems(items=>[...items,{id:`${messageId}:email-failed`,filename:'Email could not be read',mimeType:'',from:'',subject:'',receivedAt:'',messageId,reason:`Gmail could not read this email (HTTP ${String(event.status??'error')}) after retrying.`}]);
+     }
+     if(name==='attachment'){
+      const filename=String(event.filename??'resume'),mimeType=String(event.mimeType??''),encoded=String(event.data??''),normalized=encoded.replace(/-/g,'+').replace(/_/g,'/'),raw=Uint8Array.from(atob(normalized),c=>c.charCodeAt(0));
+      totals.documentsFound=Number(event.documentsFound??totals.documentsFound+1);
+      const attachmentFile=new File([raw],filename,{type:mimeType});Object.assign(attachmentFile,{mailSource:{email:String(event.from??''),subject:String(event.subject??''),receivedAt:String(event.receivedAt??'')}});
+      setStats(s=>({...s,...totals,currentFile:filename}));setMessage(`Found ${filename}; extracting candidate details…`);
+      const parsed=await onFiles([attachmentFile]);
+      if(parsed.failed){setReviewItems(items=>[...items,{id:`${String(event.messageId??'mail')}:${filename}:parse-failed`,filename,mimeType,from:String(event.from??''),subject:String(event.subject??''),receivedAt:String(event.receivedAt??''),messageId:String(event.messageId??''),reason:parsed.errors?.[0]??'This PDF or DOCX was found, but it did not contain all required candidate details.'}]);}
+      totals.documentsParsed+=parsed.parsed;totals.documentsFailed+=parsed.failed;setStats(s=>({...s,...totals,currentFile:''}));
+     }
+     if(name==='batch'){
+      updateFromEvent(event);pageToken=typeof event.nextPageToken==='string'?event.nextPageToken:undefined;
+      if(!pageToken)batchError='Gmail did not return a continuation token for the next batch.';
+      terminalEvent=true;
+     }
+     if(name==='complete'){
+      updateFromEvent(event);pageToken=undefined;complete=true;terminalEvent=true;
+      setMessage(`Scan complete. ${totals.documentsFound.toLocaleString()} resume documents found; ${totals.emailsScanned.toLocaleString()} emails checked.`);
+      setStats(s=>({...s,...totals,phase:'complete',currentFile:''}));
+     }
+     if(name==='error'){
+      updateFromEvent(event);batchError=String(event.message??'Gmail scan failed.');terminalEvent=true;
+     }
+    };
+    try{
+     while(true){const{value,done}=await reader.read();if(done)break;buffer+=decoder.decode(value,{stream:true});let boundary=buffer.indexOf('\n\n');while(boundary>=0){const block=buffer.slice(0,boundary);buffer=buffer.slice(boundary+2);await handle(block);boundary=buffer.indexOf('\n\n');}}
+    }finally{reader.releaseLock();}
+    if(batchError)throw new Error(batchError);
+    if(!terminalEvent)throw new Error('The Gmail scan batch ended before returning its continuation status.');
+   }
+  }catch(error){
+   if(controller.signal.aborted){setStats(s=>({...s,...totals,phase:'cancelled',currentFile:''}));setMessage('Scan stopped. Profiles already parsed remain in the candidate list.');}
+   else{setStats(s=>({...s,...totals,phase:'failed',currentFile:''}));setMessage(error instanceof Error?error.message:'Gmail scan failed.');}
+  }finally{abortRef.current=null;setLoading(false);onScanStateChange?.(false);}
+ }
  function stop(){abortRef.current?.abort();}
  async function disconnect(){await fetch('/api/gmail/disconnect',{method:'POST'});setConnected(false);setEmail(null);setMessage('Gmail disconnected.');}
  const emailPercent=stats.phase==='complete'?100:stats.totalEmailsEstimate?Math.min(99,Math.round(stats.emailsScanned/stats.totalEmailsEstimate*100)):0;const docsPending=Math.max(0,stats.documentsFound-stats.documentsParsed-stats.documentsFailed);const emailsRemaining=stats.totalEmailsEstimate===null?null:Math.max(0,stats.totalEmailsEstimate-stats.emailsScanned);const isActive=loading&&stats.phase==='scanning';

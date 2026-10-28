@@ -1,21 +1,644 @@
-'use client';
-import{useCallback,useEffect,useMemo,useRef,useState}from'react';import{Upload,Search,Download,FileText,Users,Briefcase,CheckCircle2,AlertTriangle,Trash2,X,ChevronDown,FileJson,Filter,RefreshCw,Mail,Phone,MapPin,Building2,ArrowRight,Activity,Menu,Layers}from'lucide-react';import type{CandidateProfile}from'@/types/candidate';import{validateFile}from'@/lib/resume/validate-file';import{extractText}from'@/lib/resume/extract-text';import{parseResume,missingRequiredResumeFields}from'@/lib/resume/resume-parser';import{filterCandidates}from'@/lib/resume/candidate-search';import{candidatesToCsv}from'@/lib/resume/export-csv';import GmailScanPanel from'@/components/GmailScanPanel';import ShortlistPanel from'@/components/ShortlistPanel';
-type DocumentPreview={url:string;name:string;mimeType:string;text:string};
-type Job={id:string;name:string;state:'Waiting'|'Extracting text'|'Parsing candidate information'|'Completed'|'Needs review'|'Failed';error?:string};
-function duplicateOf(candidate:CandidateProfile,rows:CandidateProfile[]){const email=candidate.email?.toLowerCase();const phone=candidate.phone?.replace(/\D/g,'');const name=candidate.name?.toLowerCase().replace(/[^a-z]/g,'');return rows.find(row=>{if(row.id===candidate.id)return false;const sameEmail=Boolean(email&&row.email?.toLowerCase()===email);const samePhone=Boolean(phone&&row.phone?.replace(/\D/g,'')===phone);const sameNameAndPhone=Boolean(name&&row.name?.toLowerCase().replace(/[^a-z]/g,'')===name&&phone&&row.phone?.replace(/\D/g,'')===phone);return sameEmail||samePhone||sameNameAndPhone;});}
-type CandidateGroup={key:string;versions:CandidateProfile[]};
-function profileDataScore(candidate:CandidateProfile){return Number(Boolean(candidate.name))*5+Number(Boolean(candidate.email))*5+Number(Boolean(candidate.phone))*5+Number(Boolean(candidate.location))*4+Math.min(candidate.skills.length,12)*0.5+Math.min(candidate.experience.length,6)*1.5+candidate.experience.reduce((sum,role)=>sum+Number(Boolean(role.company))*2+Number(Boolean(role.jobTitle))*2+Number(Boolean(role.startDate))*1+Number(Boolean(role.endDate||role.isCurrent))*1+Number(Boolean(role.evidence))*0.5,0)+Math.min(candidate.education.length,4)+Math.min(candidate.certifications.length,3)*0.5+Math.min(candidate.leadershipEvidence.length,4)*0.5+Number(candidate.totalExperienceYears!==null)*2+Number(candidate.statedExperienceYears!==null);}
-function groupCandidates(candidates:CandidateProfile[]):CandidateGroup[]{const parent=candidates.map((_,i)=>i);const root=(i:number):number=>parent[i]===i?i:(parent[i]=root(parent[i]));const join=(a:number,b:number)=>{const ra=root(a),rb=root(b);if(ra!==rb)parent[rb]=ra;};const owners=new Map<string,number>();for(let i=0;i<candidates.length;i++){const candidate=candidates[i],keys=[candidate.email?`email:${candidate.email.trim().toLowerCase()}`:'',candidate.phone?`phone:${candidate.phone.replace(/\D/g,'')}`:''].filter(key=>key.length>6);for(const key of keys){const owner=owners.get(key);if(owner===undefined)owners.set(key,i);else join(i,owner);}}const groups=new Map<number,CandidateProfile[]>();candidates.forEach((candidate,i)=>{const r=root(i),items=groups.get(r)??[];items.push(candidate);groups.set(r,items);});return[...groups.entries()].map(([r,versions])=>({key:candidates[r].id,versions}));}
-export default function Home(){const [rows,setRows]=useState<CandidateProfile[]>([]),[jobs,setJobs]=useState<Job[]>([]),[query,setQuery]=useState(''),[status,setStatus]=useState('all'),[min,setMin]=useState(''),[skill,setSkill]=useState(''),[selected,setSelected]=useState<string|null>(null),[duplicateGroupId,setDuplicateGroupId]=useState<string|null>(null),[activityOpen,setActivityOpen]=useState(false),[gmailScanning,setGmailScanning]=useState(false),[actionCenterOpen,setActionCenterOpen]=useState(false),[preview,setPreview]=useState<DocumentPreview|null>(null),[documentPreviews,setDocumentPreviews]=useState<Record<string,DocumentPreview>>({}),[drag,setDrag]=useState(false),[page,setPage]=useState(1),[sort,setSort]=useState<'name'|'experience'|'company'>('name');const previewUrls=useRef<Record<string,DocumentPreview>>({});const input=useRef<HTMLInputElement>(null);useEffect(()=>()=>{Object.values(previewUrls.current).forEach(item=>URL.revokeObjectURL(item.url));},[]);const current=rows.find(x=>x.id===selected)??null;const filtered=useMemo(()=>filterCandidates(rows,query,min?Number(min):null,status,skill).sort((a,b)=>{const av=sort==='name'?a.name??'':sort==='company'?a.companies[0]??'':String(a.totalExperienceYears??-1).padStart(4,'0');const bv=sort==='name'?b.name??'':sort==='company'?b.companies[0]??'':String(b.totalExperienceYears??-1).padStart(4,'0');return av.localeCompare(bv);}),[rows,query,min,status,skill,sort]);const groups=useMemo(()=>{const rank=new Map(filtered.map((candidate,index)=>[candidate.id,index] as const));return groupCandidates(rows).map(group=>{const versions=[...group.versions].sort((a,b)=>profileDataScore(b)-profileDataScore(a)||b.createdAt.localeCompare(a.createdAt));return{...group,versions,primary:versions[0],rank:Math.min(...versions.map(version=>rank.get(version.id)??Infinity))};}).filter(group=>Number.isFinite(group.rank)).sort((a,b)=>a.rank-b.rank);},[rows,filtered]);const pageCount=Math.max(1,Math.ceil(groups.length/6));const safePage=Math.min(page,pageCount);const visible=groups.slice((safePage-1)*6,safePage*6);const duplicateGroup=groups.find(group=>group.key===duplicateGroupId)??null;
- const process=useCallback(async(files:FileList|File[])=>{const list=Array.from(files);const existing=[...rows];let parsedCount=0,failedCount=0;const errors:string[]=[];const newJobs=list.map(f=>({id:crypto.randomUUID(),name:f.name,state:'Waiting' as const}));setJobs(x=>[...newJobs,...x].slice(0,24));for(let i=0;i<list.length;i++){const f=list[i],job=newJobs[i];const update=(state:Job['state'],error?:string)=>setJobs(x=>x.map(j=>j.id===job.id?{...j,state,error}:j));try{const issue=await validateFile(f);if(issue)throw new Error(issue);update('Extracting text');const text=await extractText(f);if(text.replace(/\s/g,'').length<40)throw new Error('No readable resume text found.');update('Parsing candidate information');const parsed=parseResume(text,f.name);const missing=missingRequiredResumeFields(parsed);if(missing.length)throw new Error(`Not counted as a resume. Missing required information: ${missing.join(', ')}.`);const source=(f as File&{mailSource?:{email:string;subject:string;receivedAt:string}}).mailSource;let candidate:CandidateProfile={...parsed,sourceEmail:source?.email||null,sourceSubject:source?.subject||null,sourceReceivedAt:source?.receivedAt||null};const duplicate=duplicateOf(candidate,existing);if(duplicate){candidate={...candidate,status:'needs_review',extractionWarnings:[...candidate.extractionWarnings,`Possible duplicate of ${duplicate.name??duplicate.originalFileName}.`]};}existing.unshift(candidate);const mimeType=f.type||(f.name.toLowerCase().endsWith('.pdf')?'application/pdf':'application/vnd.openxmlformats-officedocument.wordprocessingml.document');const documentPreview={url:URL.createObjectURL(f),name:f.name,mimeType,text};previewUrls.current={...previewUrls.current,[candidate.id]:documentPreview};setDocumentPreviews({...previewUrls.current});setRows(x=>[candidate,...x]);parsedCount++;update(candidate.status==='needs_review'?'Needs review':'Completed');}catch(e){failedCount++;const reason=e instanceof Error?e.message:'Could not parse this document.';errors.push(`${f.name}: ${reason}`);update('Failed',reason);}}return{parsed:parsedCount,failed:failedCount,errors};},[rows]);
- const edit=(field:keyof CandidateProfile,value:unknown)=>{if(!current)return;setRows(rs=>rs.map(r=>r.id===current.id?{...r,[field]:value,manuallyEditedFields:[...new Set([...r.manuallyEditedFields,String(field)])]} as CandidateProfile:r));};const editRole=(index:number,key:string,value:unknown)=>{if(!current)return;const experience=current.experience.map((role,i)=>i===index?{...role,[key]:value,...(key==='endDate'?{isCurrent:value===null}:{})}:role);setRows(rs=>rs.map(r=>r.id===current.id?{...r,experience,companies:[...new Set(experience.flatMap(x=>x.company?[x.company]:[]))],jobTitles:[...new Set(experience.flatMap(x=>x.jobTitle?[x.jobTitle]:[]))],manuallyEditedFields:[...new Set([...r.manuallyEditedFields,'experience'])]}:r));};const editEducation=(index:number,key:string,value:unknown)=>{if(!current)return;edit('education',current.education.map((item,i)=>i===index?{...item,[key]:value}:item));};const download=(name:string,data:string,type:string)=>{const url=URL.createObjectURL(new Blob([data],{type}));const a=document.createElement('a');a.href=url;a.download=name;a.click();URL.revokeObjectURL(url);};const deleteCandidate=(id:string)=>{const stored=previewUrls.current[id];if(stored){URL.revokeObjectURL(stored.url);const next={...previewUrls.current};delete next[id];previewUrls.current=next;setDocumentPreviews(next);}setRows(x=>x.filter(r=>r.id!==id));if(selected===id)setSelected(null);if(preview===stored)setPreview(null);};const clearSession=()=>{Object.values(previewUrls.current).forEach(item=>URL.revokeObjectURL(item.url));previewUrls.current={};setDocumentPreviews({});setRows([]);setJobs([]);setSelected(null);setPreview(null);};
- return <main className="shell"><header className="topbar"><div className="topbar-brand"><div className="brand-mark"><FileText size={18}/></div><div><b>HR Resume Manager</b><small>Recruiting workspace</small></div></div><div className="topbar-actions">{jobs.length>0&&<button className="activity-trigger" onClick={()=>setActivityOpen(true)}><span className="activity-icon"><Activity size={15}/></span>Activity<b>{jobs.length}</b><i/></button>}<div className={`nav-action-center ${actionCenterOpen?'open':''}`}><button className="action-center-toggle" aria-expanded={actionCenterOpen} onClick={()=>setActionCenterOpen(v=>!v)}><Menu size={16}/>Actions</button><div className="action-center-popover"><ShortlistPanel candidates={rows} onSelect={setSelected} disabled={!rows.length||gmailScanning||jobs.some(j=>j.state==='Waiting'||j.state==='Extracting text'||j.state==='Parsing candidate information')} variant="nav"/><button type="button" className={`nav-upload-button ${drag?'drag':''}`} onClick={()=>{setActionCenterOpen(false);input.current?.click()}} onDragOver={e=>{e.preventDefault();setDrag(true)}} onDragLeave={()=>setDrag(false)} onDrop={e=>{e.preventDefault();setDrag(false);setActionCenterOpen(false);void process(e.dataTransfer.files)}} title="Drop PDF or DOCX here · up to 10 MB each"><span className="nav-upload-icon"><Upload size={16}/></span><span><b>Add resumes</b><small>Drop PDF or DOCX · up to 10 MB each</small></span></button></div></div><input ref={input} hidden type="file" multiple accept=".pdf,.docx,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document" onChange={e=>{if(e.target.files)void process(e.target.files);e.target.value=''}}/><div className="avatar">HR</div></div></header><div className="content"><div className="heading"><div><div className="eyebrow">TALENT OPERATIONS</div><h1>Candidate workspace</h1><p>Parse resumes, review profiles, and build a focused shortlist.</p></div><button className="btn secondary" onClick={()=>download('candidates.csv',candidatesToCsv(rows),'text/csv;charset=utf-8')} disabled={!rows.length}><Download size={16}/> Export CSV</button></div>
- <GmailScanPanel onFiles={files=>process(files)} onScanStateChange={setGmailScanning}/>
+"use client";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  Upload,
+  Download,
+  FileText,
+  Users,
+  Trash2,
+  Activity,
+  Menu,
+} from "lucide-react";
+import type { CandidateProfile } from "@/types/candidate";
+import { validateFile } from "@/lib/resume/validate-file";
+import { extractText } from "@/lib/resume/extract-text";
+import {
+  parseResume,
+  missingRequiredResumeFields,
+} from "@/lib/resume/resume-parser";
+import { filterCandidates } from "@/lib/resume/candidate-search";
+import { candidatesToCsv } from "@/lib/resume/export-csv";
+import GmailScanPanel from "@/components/GmailScanPanel";
+import ShortlistPanel from "@/components/ShortlistPanel";
+import StatsCards from "@/components/dashboard/StatsCards";
+import CandidateCard, {
+  type CandidateGroup,
+} from "@/components/candidates/CandidateCard";
+import CandidateFilters from "@/components/candidates/CandidateFilters";
+import CandidatePagination from "@/components/candidates/CandidatePagination";
+import CandidateProfileDrawer from "@/components/candidates/CandidateProfileDrawer";
+import {
+  ActivityDrawer,
+  DocumentPreviewOverlay,
+  DuplicateVersionsDrawer,
+  type ActivityJob as Job,
+  type DocumentPreview,
+} from "@/components/workspace/WorkspaceOverlays";
+function duplicateOf(candidate: CandidateProfile, rows: CandidateProfile[]) {
+  const email = candidate.email?.toLowerCase();
+  const phone = candidate.phone?.replace(/\D/g, "");
+  const name = candidate.name?.toLowerCase().replace(/[^a-z]/g, "");
+  return rows.find((row) => {
+    if (row.id === candidate.id) return false;
+    const sameEmail = Boolean(email && row.email?.toLowerCase() === email);
+    const samePhone = Boolean(phone && row.phone?.replace(/\D/g, "") === phone);
+    const sameNameAndPhone = Boolean(
+      name &&
+        row.name?.toLowerCase().replace(/[^a-z]/g, "") === name &&
+        phone &&
+        row.phone?.replace(/\D/g, "") === phone
+    );
+    return sameEmail || samePhone || sameNameAndPhone;
+  });
+}
+function profileDataScore(candidate: CandidateProfile) {
+  return (
+    Number(Boolean(candidate.name)) * 5 +
+    Number(Boolean(candidate.email)) * 5 +
+    Number(Boolean(candidate.phone)) * 5 +
+    Number(Boolean(candidate.location)) * 4 +
+    Math.min(candidate.skills.length, 12) * 0.5 +
+    Math.min(candidate.experience.length, 6) * 1.5 +
+    candidate.experience.reduce(
+      (sum, role) =>
+        sum +
+        Number(Boolean(role.company)) * 2 +
+        Number(Boolean(role.jobTitle)) * 2 +
+        Number(Boolean(role.startDate)) * 1 +
+        Number(Boolean(role.endDate || role.isCurrent)) * 1 +
+        Number(Boolean(role.evidence)) * 0.5,
+      0
+    ) +
+    Math.min(candidate.education.length, 4) +
+    Math.min(candidate.certifications.length, 3) * 0.5 +
+    Math.min(candidate.leadershipEvidence.length, 4) * 0.5 +
+    Number(candidate.totalExperienceYears !== null) * 2 +
+    Number(candidate.statedExperienceYears !== null)
+  );
+}
+function groupCandidates(candidates: CandidateProfile[]): CandidateGroup[] {
+  const parent = candidates.map((_, i) => i);
+  const root = (i: number): number =>
+    parent[i] === i ? i : (parent[i] = root(parent[i]));
+  const join = (a: number, b: number) => {
+    const ra = root(a),
+      rb = root(b);
+    if (ra !== rb) parent[rb] = ra;
+  };
+  const owners = new Map<string, number>();
+  for (let i = 0; i < candidates.length; i++) {
+    const candidate = candidates[i],
+      keys = [
+        candidate.email ? `email:${candidate.email.trim().toLowerCase()}` : "",
+        candidate.phone ? `phone:${candidate.phone.replace(/\D/g, "")}` : "",
+      ].filter((key) => key.length > 6);
+    for (const key of keys) {
+      const owner = owners.get(key);
+      if (owner === undefined) owners.set(key, i);
+      else join(i, owner);
+    }
+  }
+  const groups = new Map<number, CandidateProfile[]>();
+  candidates.forEach((candidate, i) => {
+    const r = root(i),
+      items = groups.get(r) ?? [];
+    items.push(candidate);
+    groups.set(r, items);
+  });
+  return [...groups.entries()].map(([r, versions]) => ({
+    key: candidates[r].id,
+    versions,
+  }));
+}
+export default function Home() {
+  const [rows, setRows] = useState<CandidateProfile[]>([]),
+    [jobs, setJobs] = useState<Job[]>([]),
+    [query, setQuery] = useState(""),
+    [status, setStatus] = useState("all"),
+    [min, setMin] = useState(""),
+    [skill, setSkill] = useState(""),
+    [selected, setSelected] = useState<string | null>(null),
+    [duplicateGroupId, setDuplicateGroupId] = useState<string | null>(null),
+    [activityOpen, setActivityOpen] = useState(false),
+    [gmailScanning, setGmailScanning] = useState(false),
+    [actionCenterOpen, setActionCenterOpen] = useState(false),
+    [preview, setPreview] = useState<DocumentPreview | null>(null),
+    [documentPreviews, setDocumentPreviews] = useState<
+      Record<string, DocumentPreview>
+    >({}),
+    [drag, setDrag] = useState(false),
+    [page, setPage] = useState(1),
+    [sort, setSort] = useState<"name" | "experience" | "company">("name");
+  const previewUrls = useRef<Record<string, DocumentPreview>>({});
+  const input = useRef<HTMLInputElement>(null);
+  useEffect(
+    () => () => {
+      Object.values(previewUrls.current).forEach((item) =>
+        URL.revokeObjectURL(item.url)
+      );
+    },
+    []
+  );
+  const current = rows.find((x) => x.id === selected) ?? null;
+  const filtered = useMemo(
+    () =>
+      filterCandidates(
+        rows,
+        query,
+        min ? Number(min) : null,
+        status,
+        skill
+      ).sort((a, b) => {
+        const av =
+          sort === "name"
+            ? a.name ?? ""
+            : sort === "company"
+            ? a.companies[0] ?? ""
+            : String(a.totalExperienceYears ?? -1).padStart(4, "0");
+        const bv =
+          sort === "name"
+            ? b.name ?? ""
+            : sort === "company"
+            ? b.companies[0] ?? ""
+            : String(b.totalExperienceYears ?? -1).padStart(4, "0");
+        return av.localeCompare(bv);
+      }),
+    [rows, query, min, status, skill, sort]
+  );
+  const groups = useMemo(() => {
+    const rank = new Map(
+      filtered.map((candidate, index) => [candidate.id, index] as const)
+    );
+    return groupCandidates(rows)
+      .map((group) => {
+        const versions = [...group.versions].sort(
+          (a, b) =>
+            profileDataScore(b) - profileDataScore(a) ||
+            b.createdAt.localeCompare(a.createdAt)
+        );
+        return {
+          ...group,
+          versions,
+          primary: versions[0],
+          rank: Math.min(
+            ...versions.map((version) => rank.get(version.id) ?? Infinity)
+          ),
+        };
+      })
+      .filter((group) => Number.isFinite(group.rank))
+      .sort((a, b) => a.rank - b.rank);
+  }, [rows, filtered]);
+  const pageCount = Math.max(1, Math.ceil(groups.length / 6));
+  const safePage = Math.min(page, pageCount);
+  const visible = groups.slice((safePage - 1) * 6, safePage * 6);
+  const duplicateGroup =
+    groups.find((group) => group.key === duplicateGroupId) ?? null;
+  const process = useCallback(
+    async (files: FileList | File[]) => {
+      const list = Array.from(files);
+      const existing = [...rows];
+      let parsedCount = 0,
+        failedCount = 0;
+      const errors: string[] = [];
+      const newJobs = list.map((f) => ({
+        id: crypto.randomUUID(),
+        name: f.name,
+        state: "Waiting" as const,
+      }));
+      setJobs((x) => [...newJobs, ...x].slice(0, 24));
+      for (let i = 0; i < list.length; i++) {
+        const f = list[i],
+          job = newJobs[i];
+        const update = (state: Job["state"], error?: string) =>
+          setJobs((x) =>
+            x.map((j) => (j.id === job.id ? { ...j, state, error } : j))
+          );
+        try {
+          const issue = await validateFile(f);
+          if (issue) throw new Error(issue);
+          update("Extracting text");
+          const text = await extractText(f);
+          if (text.replace(/\s/g, "").length < 40)
+            throw new Error("No readable resume text found.");
+          update("Parsing candidate information");
+          const parsed = parseResume(text, f.name);
+          const missing = missingRequiredResumeFields(parsed);
+          if (missing.length)
+            throw new Error(
+              `Not counted as a resume. Missing required information: ${missing.join(
+                ", "
+              )}.`
+            );
+          const source = (
+            f as File & {
+              mailSource?: {
+                email: string;
+                subject: string;
+                receivedAt: string;
+              };
+            }
+          ).mailSource;
+          let candidate: CandidateProfile = {
+            ...parsed,
+            sourceEmail: source?.email || null,
+            sourceSubject: source?.subject || null,
+            sourceReceivedAt: source?.receivedAt || null,
+          };
+          const duplicate = duplicateOf(candidate, existing);
+          if (duplicate) {
+            candidate = {
+              ...candidate,
+              status: "needs_review",
+              extractionWarnings: [
+                ...candidate.extractionWarnings,
+                `Possible duplicate of ${
+                  duplicate.name ?? duplicate.originalFileName
+                }.`,
+              ],
+            };
+          }
+          existing.unshift(candidate);
+          const mimeType =
+            f.type ||
+            (f.name.toLowerCase().endsWith(".pdf")
+              ? "application/pdf"
+              : "application/vnd.openxmlformats-officedocument.wordprocessingml.document");
+          const documentPreview = {
+            url: URL.createObjectURL(f),
+            name: f.name,
+            mimeType,
+            text,
+          };
+          previewUrls.current = {
+            ...previewUrls.current,
+            [candidate.id]: documentPreview,
+          };
+          setDocumentPreviews({ ...previewUrls.current });
+          setRows((x) => [candidate, ...x]);
+          parsedCount++;
+          update(
+            candidate.status === "needs_review" ? "Needs review" : "Completed"
+          );
+        } catch (e) {
+          failedCount++;
+          const reason =
+            e instanceof Error ? e.message : "Could not parse this document.";
+          errors.push(`${f.name}: ${reason}`);
+          update("Failed", reason);
+        }
+      }
+      return { parsed: parsedCount, failed: failedCount, errors };
+    },
+    [rows]
+  );
+  const edit = (field: keyof CandidateProfile, value: unknown) => {
+    if (!current) return;
+    setRows((rs) =>
+      rs.map((r) =>
+        r.id === current.id
+          ? ({
+              ...r,
+              [field]: value,
+              manuallyEditedFields: [
+                ...new Set([...r.manuallyEditedFields, String(field)]),
+              ],
+            } as CandidateProfile)
+          : r
+      )
+    );
+  };
+  const editRole = (index: number, key: string, value: unknown) => {
+    if (!current) return;
+    const experience = current.experience.map((role, i) =>
+      i === index
+        ? {
+            ...role,
+            [key]: value,
+            ...(key === "endDate" ? { isCurrent: value === null } : {}),
+          }
+        : role
+    );
+    setRows((rs) =>
+      rs.map((r) =>
+        r.id === current.id
+          ? {
+              ...r,
+              experience,
+              companies: [
+                ...new Set(
+                  experience.flatMap((x) => (x.company ? [x.company] : []))
+                ),
+              ],
+              jobTitles: [
+                ...new Set(
+                  experience.flatMap((x) => (x.jobTitle ? [x.jobTitle] : []))
+                ),
+              ],
+              manuallyEditedFields: [
+                ...new Set([...r.manuallyEditedFields, "experience"]),
+              ],
+            }
+          : r
+      )
+    );
+  };
+  const editEducation = (index: number, key: string, value: unknown) => {
+    if (!current) return;
+    edit(
+      "education",
+      current.education.map((item, i) =>
+        i === index ? { ...item, [key]: value } : item
+      )
+    );
+  };
+  const download = (name: string, data: string, type: string) => {
+    const url = URL.createObjectURL(new Blob([data], { type }));
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = name;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+  const deleteCandidate = (id: string) => {
+    const stored = previewUrls.current[id];
+    if (stored) {
+      URL.revokeObjectURL(stored.url);
+      const next = { ...previewUrls.current };
+      delete next[id];
+      previewUrls.current = next;
+      setDocumentPreviews(next);
+    }
+    setRows((x) => x.filter((r) => r.id !== id));
+    if (selected === id) setSelected(null);
+    if (preview === stored) setPreview(null);
+  };
+  const clearSession = () => {
+    Object.values(previewUrls.current).forEach((item) =>
+      URL.revokeObjectURL(item.url)
+    );
+    previewUrls.current = {};
+    setDocumentPreviews({});
+    setRows([]);
+    setJobs([]);
+    setSelected(null);
+    setPreview(null);
+  };
+  return (
+    <main className="shell">
+      <header className="topbar">
+        <div className="topbar-brand">
+          <div className="brand-mark">
+            <FileText size={18} />
+          </div>
+          <div>
+            <b>HR Resume Manager</b>
+            <small>Recruiting workspace</small>
+          </div>
+        </div>
+        <div className="topbar-actions">
+          {jobs.length > 0 && (
+            <button
+              className="activity-trigger"
+              onClick={() => setActivityOpen(true)}
+            >
+              <span className="activity-icon">
+                <Activity size={15} />
+              </span>
+              Activity<b>{jobs.length}</b>
+              <i />
+            </button>
+          )}
+          <div
+            className={`nav-action-center ${actionCenterOpen ? "open" : ""}`}
+          >
+            <button
+              className="action-center-toggle"
+              aria-expanded={actionCenterOpen}
+              onClick={() => setActionCenterOpen((v) => !v)}
+            >
+              <Menu size={16} />
+              Actions
+            </button>
+            <div className="action-center-popover">
+              <ShortlistPanel
+                candidates={rows}
+                onSelect={setSelected}
+                disabled={
+                  !rows.length ||
+                  gmailScanning ||
+                  jobs.some(
+                    (j) =>
+                      j.state === "Waiting" ||
+                      j.state === "Extracting text" ||
+                      j.state === "Parsing candidate information"
+                  )
+                }
+                variant="nav"
+              />
+              <button
+                type="button"
+                className={`nav-upload-button ${drag ? "drag" : ""}`}
+                onClick={() => {
+                  setActionCenterOpen(false);
+                  input.current?.click();
+                }}
+                onDragOver={(e) => {
+                  e.preventDefault();
+                  setDrag(true);
+                }}
+                onDragLeave={() => setDrag(false)}
+                onDrop={(e) => {
+                  e.preventDefault();
+                  setDrag(false);
+                  setActionCenterOpen(false);
+                  void process(e.dataTransfer.files);
+                }}
+                title="Drop PDF or DOCX here · up to 10 MB each"
+              >
+                <span className="nav-upload-icon">
+                  <Upload size={16} />
+                </span>
+                <span>
+                  <b>Add resumes</b>
+                  <small>Drop PDF or DOCX · up to 10 MB each</small>
+                </span>
+              </button>
+            </div>
+          </div>
+          <input
+            ref={input}
+            hidden
+            type="file"
+            multiple
+            accept=".pdf,.docx,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            onChange={(e) => {
+              if (e.target.files) void process(e.target.files);
+              e.target.value = "";
+            }}
+          />
+          <div className="avatar">HR</div>
+        </div>
+      </header>
+      <div className="content">
+        <div className="heading">
+          <div>
+            <div className="eyebrow">TALENT OPERATIONS</div>
+            <h1>Candidate workspace</h1>
+            <p>
+              Parse resumes, review profiles, and build a focused shortlist.
+            </p>
+          </div>
+          <button
+            className="btn secondary"
+            onClick={() =>
+              download(
+                "candidates.csv",
+                candidatesToCsv(rows),
+                "text/csv;charset=utf-8"
+              )
+            }
+            disabled={!rows.length}
+          >
+            <Download size={16} /> Export CSV
+          </button>
+        </div>
+        <GmailScanPanel
+          onFiles={(files) => process(files)}
+          onScanStateChange={setGmailScanning}
+        />
 
- <div className="stats"><div className="stat"><div className="stat-icon lavender"><Users size={18}/></div><div><small>Profiles parsed</small><b>{rows.length}</b></div><span className="stat-note">in this session</span></div><div className="stat"><div className="stat-icon green"><CheckCircle2 size={18}/></div><div><small>Ready to review</small><b>{rows.filter(x=>x.status==='needs_review').length}</b></div><span className="stat-note">need attention</span></div><div className="stat"><div className="stat-icon peach"><Briefcase size={18}/></div><div><small>Avg. experience</small><b>{rows.length?(rows.reduce((s,x)=>s+(x.totalExperienceYears??0),0)/rows.length).toFixed(1):'—'}<em> yrs</em></b></div><span className="stat-note">calculated from roles</span></div></div>
- <section className="candidate-section"><div className="section-head"><div><h2>Candidates <span className="count">{groups.length}</span></h2><p>Review and manage extracted candidate profiles.</p></div><div className="table-actions"><button className="btn small secondary" onClick={clearSession} disabled={!rows.length}><Trash2 size={14}/> Clear session</button></div></div><div className="filters"><label className="search"><Search size={16}/><input placeholder="Search name, email, company, skill..." value={query} onChange={e=>setQuery(e.target.value)}/>{query&&<button onClick={()=>setQuery('')}><X size={14}/></button>}</label><label className="select-wrap"><Filter size={15}/><select value={status} onChange={e=>setStatus(e.target.value)}><option value="all">All statuses</option><option value="completed">Completed</option><option value="needs_review">Needs review</option></select><ChevronDown size={13}/></label><label className="select-wrap"><select value={min} onChange={e=>setMin(e.target.value)}><option value="">Any experience</option><option value="1">1+ years</option><option value="3">3+ years</option><option value="5">5+ years</option><option value="8">8+ years</option></select><ChevronDown size={13}/></label><label className="select-wrap"><select value={skill} onChange={e=>setSkill(e.target.value)}><option value="">All skills</option>{[...new Set(rows.flatMap(r=>r.skills))].sort().map(s=><option key={s}>{s}</option>)}</select><ChevronDown size={13}/></label><label className="select-wrap"><select aria-label="Sort candidates" value={sort} onChange={e=>setSort(e.target.value as 'name'|'experience'|'company')}><option value="name">Sort: name</option><option value="experience">Sort: experience</option><option value="company">Sort: company</option></select><ChevronDown size={13}/></label></div>
- <div className="candidate-grid">{visible.map(({primary:c,versions,key:groupKey},index)=>{const duplicate=versions.length>1;return <article className={`candidate-card ${duplicate?'duplicate-card':''}`} key={groupKey} style={{'--card-index':index} as React.CSSProperties}><div className="candidate-card-top"><div className="candidate-avatar">{(c.name??'?').slice(0,1).toUpperCase()}</div><span className={`pill ${c.status==='completed'?'pill-green':'pill-amber'}`}><i/>{c.status==='completed'?'Parsed':'Needs review'}</span><button className="card-document" title="Preview original resume" onClick={()=>{const source=documentPreviews[c.id];if(source)setPreview(source)}}><FileText size={14}/>Document</button><button className="card-export" title="Export profile JSON" onClick={()=>download(`${(c.name??'candidate').toLowerCase().replace(/\s+/g,'-')}.json`,JSON.stringify(c,null,2),'application/json')}><Download size={15}/></button></div>{duplicate&&<button className="duplicate-stack-trigger" onClick={e=>{e.stopPropagation();setDuplicateGroupId(groupKey)}}><span className="duplicate-stack-glyph"><Layers size={16}/><i>{versions.length}</i></span><span className="duplicate-stack-copy"><b>Duplicate stack</b><small>{versions.length} resume versions · sorted by profile detail</small></span><span className="duplicate-stack-link">See all<ArrowRight size={13}/></span></button>}<button className="card-open" onClick={()=>setSelected(c.id)}><h3>{c.name??'Name not identified'}</h3><span className="card-filename">{c.originalFileName}</span><div className="card-contact"><span><Mail size={13}/>{c.email??'Email not found'}</span><span><Phone size={13}/>{c.phone??'Phone not found'}</span></div><div className="card-facts"><div><small>EXPERIENCE</small><b>{c.totalExperienceYears===null?'—':`${c.totalExperienceYears} yrs`}</b></div><div><small>LOCATION</small><b><MapPin size={13}/>{c.location??'Not identified'}</b></div><div className="card-company"><small>MOST RECENT COMPANY</small><b><Building2 size={13}/>{c.companies.at(-1)??'Not identified'}</b></div></div><div className="card-skills">{c.skills.slice(0,4).map(x=><span className="tag" key={x}>{x}</span>)}{c.skills.length>4&&<span className="more">+{c.skills.length-4} more</span>}{!c.skills.length&&<span className="more">No recognized skills</span>}</div><div className="card-bottom">{c.sourceEmail?<span>From {c.sourceEmail}</span>:<span>Manual upload</span>}<span className="view-profile">View profile <ArrowRight size={13}/></span></div></button></article>;})}{!visible.length&&<div className="empty"><div className="empty-icon"><Users size={22}/></div><b>{rows.length?'No candidates match your filters':'No candidates yet'}</b><p>{rows.length?'Try adjusting your search or filters.':'Upload resumes or scan Gmail to create candidate profiles.'}</p></div>}</div><div className="table-footer">Showing <b>{groups.length?((safePage-1)*6+1):0}–{Math.min(safePage*6,groups.length)}</b> of <b>{groups.length}</b> candidate records <span>•</span> Session only <div className="pagination"><button disabled={safePage<=1} onClick={()=>setPage(p=>Math.max(1,p-1))}>Previous</button><span>{safePage} / {pageCount}</span><button disabled={safePage>=pageCount} onClick={()=>setPage(p=>Math.min(pageCount,p+1))}>Next</button></div></div></section><footer>HR Resume Manager <span>•</span> Browser-based extraction <span className="footer-right">Your data stays on this device</span></footer></div>
- {duplicateGroup&&<div className="overlay duplicate-overlay" onMouseDown={e=>{if(e.target===e.currentTarget)setDuplicateGroupId(null)}}><aside className="duplicate-drawer"><header className="duplicate-drawer-head"><div><div className="drawer-kicker">DUPLICATE PROFILES</div><h2>{duplicateGroup.versions[0].name??'Candidate versions'}</h2><p>{duplicateGroup.versions.length} versions share the same email address or phone number. Compare the original files and extracted details.</p></div><button aria-label="Close candidate versions" onClick={()=>setDuplicateGroupId(null)}><X size={18}/></button></header><div className="duplicate-version-list">{duplicateGroup.versions.map(version=><article className="duplicate-version" key={version.id}><div className="duplicate-version-top"><div className="candidate-avatar">{(version.name??'?').slice(0,1).toUpperCase()}</div><div className="duplicate-version-title"><b>{version.name??'Name not identified'}</b><span>{version.id===duplicateGroup.primary.id?'Most complete version':'Saved version'}</span></div><span className={`pill ${version.status==='completed'?'pill-green':'pill-amber'}`}><i/>{version.status==='completed'?'Parsed':'Needs review'}</span></div><div className="duplicate-version-file"><FileText size={14}/><span title={version.originalFileName}>{version.originalFileName}</span></div><div className="duplicate-version-meta"><span>{version.email??'Email not identified'}</span><span>{version.phone??'Phone not identified'}</span><span>{version.sourceEmail?`From ${version.sourceEmail}`:'Manual upload'} · {new Date(version.createdAt).toLocaleDateString()}</span></div><div className="duplicate-version-skills">{version.skills.slice(0,6).map(value=><em key={value}>{value}</em>)}</div><div className="duplicate-version-actions"><button className="btn secondary" disabled={!documentPreviews[version.id]} onClick={()=>{const document=documentPreviews[version.id];if(document){setPreview(document);setDuplicateGroupId(null);}}}><FileText size={14}/>Preview resume</button><button className="btn primary" onClick={()=>{setSelected(version.id);setDuplicateGroupId(null)}}>Open profile<ArrowRight size={14}/></button></div></article>)}</div></aside></div>}
- {activityOpen&&<div className="overlay activity-overlay" onMouseDown={e=>{if(e.target===e.currentTarget)setActivityOpen(false)}}><aside className="activity-drawer"><header className="activity-drawer-head"><div><span className="drawer-kicker">WORKSPACE</span><h2>Activity</h2></div><button aria-label="Close activity" onClick={()=>setActivityOpen(false)}><X size={18}/></button></header><div className="activity-drawer-body">{jobs.length?jobs.map(j=><div className="activity-item" key={j.id}><div className={`activity-state ${j.state==='Failed'?'failed':j.state==='Completed'||j.state==='Needs review'?'done':''}`}>{j.state==='Failed'?<AlertTriangle size={15}/>:j.state==='Completed'||j.state==='Needs review'?<CheckCircle2 size={15}/>:<RefreshCw size={14}/>}</div><div className="activity-item-copy"><b>{j.name}</b><span>{j.state}</span>{j.error&&<small>{j.error}</small>}</div></div>):<div className="activity-empty">No recent activity yet.</div>}</div><footer className="activity-drawer-foot"><span>{jobs.length} recent files</span><button className="text-btn" onClick={()=>setJobs([])} disabled={!jobs.length}>Clear activity</button></footer></aside></div>} {preview&&<div className="overlay document-overlay" onMouseDown={e=>{if(e.target===e.currentTarget)setPreview(null)}}><section className="document-viewer"><header className="document-toolbar"><div><FileText size={17}/><div><b>{preview.name}</b><small>Original resume document</small></div></div><div><a href={preview.url} download={preview.name} className="document-download"><Download size={14}/> Download</a><button aria-label="Close document preview" onClick={()=>setPreview(null)}><X size={18}/></button></div></header>{preview.mimeType==='application/pdf'?<iframe className="pdf-preview" title={`Resume document: ${preview.name}`} src={preview.url}/>:<div className="docx-preview"><pre>{preview.text}</pre></div>}</section></div>}{current&&<div className="overlay" onMouseDown={e=>{if(e.target===e.currentTarget)setSelected(null)}}><aside className="drawer"><div className="drawer-top"><span>Candidate profile</span><div><button title="Delete candidate" onClick={()=>deleteCandidate(current.id)}><Trash2 size={16}/></button><button title="Close" onClick={()=>setSelected(null)}><X size={18}/></button></div></div><div className="profile-head"><div className="profile-avatar">{(current.name??'?').slice(0,1).toUpperCase()}</div><div><input className="name-edit" value={current.name??''} placeholder="Candidate name" onChange={e=>edit('name',e.target.value||null)}/><div className="profile-file"><FileText size={13}/>{current.originalFileName}</div></div><span className={`pill ${current.status==='completed'?'pill-green':'pill-amber'}`}>{current.status==='completed'?'Completed':'Needs review'}</span></div><div className="drawer-content"><div className="profile-section"><h4>Contact information</h4><div className="form-grid"><EditField label="Email" value={current.email} onChange={v=>edit('email',v||null)}/><EditField label="Phone" value={current.phone} onChange={v=>edit('phone',v||null)}/><EditField label="Location" value={current.location} onChange={v=>edit('location',v||null)}/></div></div><div className="profile-section"><h4>Experience summary</h4><div className="experience-summary"><label>Calculated years<input type="number" min="0" step="0.1" value={current.totalExperienceYears??''} onChange={e=>edit('totalExperienceYears',e.target.value?Number(e.target.value):null)}/></label><label>Stated years<input type="number" min="0" step="0.1" value={current.statedExperienceYears??''} onChange={e=>edit('statedExperienceYears',e.target.value?Number(e.target.value):null)}/></label></div></div><div className="profile-section"><h4>Technical skills <small>{current.skills.length}</small></h4><textarea className="edit-area" value={current.skills.join(', ')} onChange={e=>edit('skills',e.target.value.split(',').map(x=>x.trim()).filter(Boolean))} placeholder="Add skills, separated by commas"/><div className="hint">Separate skills with commas.</div></div><div className="profile-section"><h4>Employment history</h4>{current.experience.length?current.experience.map((x,i)=><div className="role" key={i}><div className="form-grid"><EditField label="Job title" value={x.jobTitle} onChange={v=>editRole(i,'jobTitle',v||null)}/><EditField label="Company" value={x.company} onChange={v=>editRole(i,'company',v||null)}/><EditField label="Start date" value={x.startDate} onChange={v=>editRole(i,'startDate',v||null)}/><EditField label="End date" value={x.isCurrent?'Present':x.endDate} onChange={v=>editRole(i,'endDate',v==='Present'?null:v||null)}/></div><label className="field"><span>Supporting resume text</span><textarea className="edit-area" value={x.evidence} onChange={e=>editRole(i,'evidence',e.target.value)}/></label></div>):<p className="muted">No confident employment records extracted.</p>}</div><div className="profile-section"><h4>Leadership evidence</h4>{current.leadershipEvidence.length?current.leadershipEvidence.map((x,i)=><div className="evidence" key={i}><span>{x.category.replaceAll('_',' ')}</span><textarea className="edit-area" value={x.evidenceText} onChange={e=>edit('leadershipEvidence',current.leadershipEvidence.map((item,j)=>j===i?{...item,evidenceText:e.target.value,statement:e.target.value}:item))}/></div>):<p className="muted">No explicit leadership evidence found.</p>}</div><div className="profile-section"><h4>Education</h4>{current.education.length?current.education.map((x,i)=><div className="education form-grid" key={i}><EditField label="Qualification" value={x.qualification} onChange={v=>editEducation(i,'qualification',v)}/><EditField label="Institution" value={x.institution} onChange={v=>editEducation(i,'institution',v||null)}/><label className="field"><span>Graduation year</span><input type="number" value={x.graduationYear??''} onChange={e=>editEducation(i,'graduationYear',e.target.value?Number(e.target.value):null)}/></label></div>):<p className="muted">No education details extracted.</p>}</div><div className="profile-section"><h4>Certifications</h4>{current.certifications.length?<ul>{current.certifications.map(x=><li key={x}>{x}</li>)}</ul>:<p className="muted">No certifications extracted.</p>}</div><div className="profile-section"><h4>Extraction warnings</h4>{current.extractionWarnings.length?current.extractionWarnings.map(x=><div className="warning" key={x}><AlertTriangle size={14}/>{x}</div>):<p className="muted">No extraction warnings.</p>}</div><details className="profile-section raw"><summary><h4>Original extracted resume text</h4></summary><pre>{current.extractedText}</pre></details></div><div className="drawer-footer"><span>{current.manuallyEditedFields.length?`Manually edited: ${current.manuallyEditedFields.join(', ')}`:'Fields can be edited inline'}</span><button className="btn primary" onClick={()=>download(`${(current.name??'candidate').toLowerCase().replace(/\s+/g,'-')}.json`,JSON.stringify(current,null,2),'application/json')}><FileJson size={15}/> Export JSON</button></div></aside></div>}
- </main>}
-function EditField({label,value,onChange}:{label:string;value:string|null;onChange:(v:string)=>void}){return <label className="field"><span>{label}</span><input value={value??''} placeholder="Not identified" onChange={e=>onChange(e.target.value)}/></label>}
+        <StatsCards candidates={rows} />
+        <section className="candidate-section">
+          <div className="section-head">
+            <div>
+              <h2>
+                Candidates <span className="count">{groups.length}</span>
+              </h2>
+              <p>Review and manage extracted candidate profiles.</p>
+            </div>
+            <div className="table-actions">
+              <button
+                className="btn small secondary"
+                onClick={clearSession}
+                disabled={!rows.length}
+              >
+                <Trash2 size={14} /> Clear session
+              </button>
+            </div>
+          </div>
+          <CandidateFilters
+            query={query}
+            status={status}
+            minExperience={min}
+            skill={skill}
+            sort={sort}
+            skills={[...new Set(rows.flatMap((row) => row.skills))].sort()}
+            onQueryChange={setQuery}
+            onStatusChange={setStatus}
+            onMinExperienceChange={setMin}
+            onSkillChange={setSkill}
+            onSortChange={setSort}
+          />
+          <div className="candidate-grid grid grid-cols-1 gap-[14px] min-[761px]:grid-cols-2 min-[1101px]:grid-cols-3">
+            {visible.map(({ primary, versions, key }, index) => (
+              <CandidateCard
+                key={key}
+                candidate={primary}
+                versions={versions}
+                groupKey={key}
+                index={index}
+                hasDocument={Boolean(documentPreviews[primary.id])}
+                onPreview={(id) => {
+                  const source = documentPreviews[id];
+                  if (source) setPreview(source);
+                }}
+                onExport={(candidate) =>
+                  download(
+                    `${(candidate.name ?? "candidate").toLowerCase().replace(/\s+/g, "-")}.json`,
+                    JSON.stringify(candidate, null, 2),
+                    "application/json"
+                  )
+                }
+                onOpenProfile={setSelected}
+                onSeeVersions={setDuplicateGroupId}
+              />
+            ))}
+            {!visible.length && (
+              <div className="empty">
+                <div className="empty-icon">
+                  <Users size={22} />
+                </div>
+                <b>
+                  {rows.length
+                    ? "No candidates match your filters"
+                    : "No candidates yet"}
+                </b>
+                <p>
+                  {rows.length
+                    ? "Try adjusting your search or filters."
+                    : "Upload resumes or scan Gmail to create candidate profiles."}
+                </p>
+              </div>
+            )}
+          </div>
+          <CandidatePagination
+            page={safePage}
+            pageCount={pageCount}
+            total={groups.length}
+            pageSize={6}
+            onPageChange={setPage}
+          />
+        </section>
+        <footer>
+          HR Resume Manager <span>•</span> Browser-based extraction{" "}
+          <span className="footer-right">Your data stays on this device</span>
+        </footer>
+      </div>
+      {duplicateGroup && (
+        <DuplicateVersionsDrawer
+          group={duplicateGroup}
+          documents={documentPreviews}
+          onClose={() => setDuplicateGroupId(null)}
+          onPreview={(document) => {
+            setPreview(document);
+            setDuplicateGroupId(null);
+          }}
+          onOpenProfile={(id) => {
+            setSelected(id);
+            setDuplicateGroupId(null);
+          }}
+        />
+      )}
+      {activityOpen && (
+        <ActivityDrawer
+          jobs={jobs}
+          onClose={() => setActivityOpen(false)}
+          onClear={() => setJobs([])}
+        />
+      )}
+      {preview && (
+        <DocumentPreviewOverlay
+          preview={preview}
+          onClose={() => setPreview(null)}
+        />
+      )}
+      {current && (
+        <CandidateProfileDrawer
+          candidate={current}
+          onClose={() => setSelected(null)}
+          onDelete={deleteCandidate}
+          onEdit={edit}
+          onEditRole={editRole}
+          onEditEducation={editEducation}
+          onExport={(candidate) =>
+            download(
+              `${(candidate.name ?? "candidate").toLowerCase().replace(/\s+/g, "-")}.json`,
+              JSON.stringify(candidate, null, 2),
+              "application/json"
+            )
+          }
+        />
+      )}
+    </main>
+  );
+}

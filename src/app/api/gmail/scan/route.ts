@@ -17,7 +17,56 @@ type Message = {
   internalDate?: string;
 };
 const MAX_ATTACHMENT = 10 * 1024 * 1024;
+const EMAILS_PER_BATCH = 10;
 const encoder = new TextEncoder();
+export const maxDuration = 60;
+
+type ScanTotals = {
+  emailsScanned?: number;
+  documentsFound?: number;
+  failedEmails?: number;
+  skippedAttachments?: number;
+  totalEmailsEstimate?: number | null;
+};
+
+async function fetchGmail(url: URL | string, token: string, signal: AbortSignal) {
+  let response: Response | undefined;
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try {
+      response = await fetch(url, {
+        headers: { authorization: `Bearer ${token}` },
+        signal,
+        cache: "no-store",
+      });
+    } catch (error) {
+      if (signal.aborted || attempt === 3) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 300 * 2 ** attempt));
+      continue;
+    }
+    let gmailRateLimited = false;
+    if (response.status === 403) {
+      const payload = (await response.clone().json().catch(() => null)) as {
+        error?: { errors?: Array<{ reason?: string }> };
+      } | null;
+      gmailRateLimited = Boolean(
+        payload?.error?.errors?.some((item) =>
+          ["rateLimitExceeded", "userRateLimitExceeded", "backendError"].includes(
+            item.reason ?? ""
+          )
+        )
+      );
+    }
+    const retryable =
+      [429, 500, 502, 503, 504].includes(response.status) || gmailRateLimited;
+    if (!retryable || attempt === 3) return response;
+    const retryAfter = Number(response.headers.get("retry-after"));
+    const delay = Number.isFinite(retryAfter) && retryAfter > 0
+      ? Math.min(retryAfter * 1000, 5000)
+      : 300 * 2 ** attempt;
+    await new Promise((resolve) => setTimeout(resolve, delay));
+  }
+  return response!;
+}
 function flatten(part: Part | undefined): Part[] {
   if (!part) return [];
   return [part, ...(part.parts ?? []).flatMap(flatten)];
@@ -33,13 +82,26 @@ export async function POST(request: Request) {
       { error: "Connect Gmail before scanning." },
       { status: 401 }
     );
-  let body: { startDate?: string; endDate?: string };
+  let body: {
+    startDate?: string;
+    endDate?: string;
+    pageToken?: string;
+    totals?: ScanTotals;
+  };
   try {
     body = await request.json();
   } catch {
     return NextResponse.json({ error: "Invalid scan range." }, { status: 400 });
   }
   const { startDate, endDate } = body;
+  if (
+    body.pageToken !== undefined &&
+    (typeof body.pageToken !== "string" || body.pageToken.length > 8192)
+  )
+    return NextResponse.json(
+      { error: "Invalid Gmail scan cursor." },
+      { status: 400 }
+    );
   if (
     !startDate ||
     !endDate ||
@@ -96,55 +158,54 @@ export async function POST(request: Request) {
           });
       };
       void (async () => {
-        let emailsScanned = 0,
-          documentsFound = 0,
-          failedEmails = 0,
-          skippedAttachments = 0,
-          totalEmailsEstimate = 0,
-          pageToken: string | undefined;
+        const count = (value: number | undefined) =>
+          Number.isSafeInteger(value) && (value ?? -1) >= 0 ? value! : 0;
+        let emailsScanned = count(body.totals?.emailsScanned),
+          documentsFound = count(body.totals?.documentsFound),
+          failedEmails = count(body.totals?.failedEmails),
+          skippedAttachments = count(body.totals?.skippedAttachments),
+          totalEmailsEstimate = body.totals?.totalEmailsEstimate ?? null;
         try {
-          do {
             const url = new URL(
               "https://gmail.googleapis.com/gmail/v1/users/me/messages"
             );
             url.searchParams.set("q", query);
-            url.searchParams.set("maxResults", "100");
-            if (pageToken) url.searchParams.set("pageToken", pageToken);
-            const response = await fetch(url, {
-              headers: { authorization: `Bearer ${authorized.accessToken}` },
-              signal: request.signal,
-              cache: "no-store",
-            });
+            url.searchParams.set("maxResults", String(EMAILS_PER_BATCH));
+            if (body.pageToken) url.searchParams.set("pageToken", body.pageToken);
+            const response = await fetchGmail(url, authorized.accessToken, request.signal);
             if (!response.ok)
-              throw new Error("Gmail could not search this mailbox.");
+              throw new Error(`Gmail could not search this mailbox (${response.status}).`);
             const listing = (await response.json()) as {
               messages?: Array<{ id: string }>;
               resultSizeEstimate?: number;
               nextPageToken?: string;
             };
             const messages = listing.messages ?? [];
-            if (!pageToken) {
-              totalEmailsEstimate =
-                listing.resultSizeEstimate ?? messages.length;
-              await emit("start", { totalEmailsEstimate });
-            }
+            totalEmailsEstimate ??= listing.resultSizeEstimate ?? messages.length;
+            await emit("start", {
+              totalEmailsEstimate,
+              emailsScanned,
+              documentsFound,
+              failedEmails,
+              skippedAttachments,
+            });
             for (const item of messages) {
               if (wasCancelled || request.signal.aborted) return;
-              const messageResponse = await fetch(
+              const messageResponse = await fetchGmail(
                 `https://gmail.googleapis.com/gmail/v1/users/me/messages/${encodeURIComponent(
                   item.id
                 )}?format=full`,
-                {
-                  headers: {
-                    authorization: `Bearer ${authorized.accessToken}`,
-                  },
-                  signal: request.signal,
-                  cache: "no-store",
-                }
+                authorized.accessToken,
+                request.signal
               );
               if (!messageResponse.ok) {
                 failedEmails++;
                 emailsScanned++;
+                await emit("email_failed", {
+                  messageId: item.id,
+                  status: messageResponse.status,
+                  failedEmails,
+                });
                 await emit("progress", {
                   emailsScanned,
                   totalEmailsEstimate,
@@ -206,19 +267,14 @@ export async function POST(request: Request) {
                 }
                 let data = part.body?.data;
                 if (part.body?.attachmentId) {
-                  const attachmentResponse = await fetch(
+                  const attachmentResponse = await fetchGmail(
                     `https://gmail.googleapis.com/gmail/v1/users/me/messages/${encodeURIComponent(
                       item.id
                     )}/attachments/${encodeURIComponent(
                       part.body.attachmentId
                     )}`,
-                    {
-                      headers: {
-                        authorization: `Bearer ${authorized.accessToken}`,
-                      },
-                      signal: request.signal,
-                      cache: "no-store",
-                    }
+                    authorized.accessToken,
+                    request.signal
                   );
                   if (!attachmentResponse.ok) {
                     await skipAttachment("Gmail could not retrieve this attachment.");
@@ -246,15 +302,14 @@ export async function POST(request: Request) {
                 });
               }
             }
-            pageToken = listing.nextPageToken;
-          } while (pageToken && !wasCancelled && !request.signal.aborted);
-          if (!wasCancelled && !request.signal.aborted)
-            await emit("complete", {
+            if (!wasCancelled && !request.signal.aborted)
+              await emit(listing.nextPageToken ? "batch" : "complete", {
               emailsScanned,
               totalEmailsEstimate,
               documentsFound,
               failedEmails,
               skippedAttachments,
+                nextPageToken: listing.nextPageToken ?? null,
             });
         } catch (error) {
           if (!wasCancelled && !request.signal.aborted)
