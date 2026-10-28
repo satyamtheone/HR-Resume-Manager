@@ -47,6 +47,8 @@ type ReviewItem = {
   reason: string;
 };
 type LongFile = { file: File; event: ScanEvent };
+const DEFAULT_EMAILS_PER_BATCH = 5;
+const MAX_NETWORK_RETRIES = 10;
 const initialStats: ScanStats = {
   phase: "idle",
   emailsScanned: 0,
@@ -295,7 +297,8 @@ export default function GmailScanPanel({
       pageToken: string | undefined,
       complete = false,
       quotaRetryCount = 0,
-      networkRetryCount = 0;
+      networkRetryCount = 0,
+      pageSize = DEFAULT_EMAILS_PER_BATCH;
     try {
       while (windowIndex < windows.length && !complete && !controller.signal.aborted) {
         const currentWindow = windows[windowIndex];
@@ -309,22 +312,47 @@ export default function GmailScanPanel({
           setMessage(`Scanning five-day window ${windowIndex + 1} of ${windows.length}: ${currentWindow.start} to ${currentWindow.end}.`);
         }
         let response: Response;
+        const requestController = new AbortController();
+        const abortRequestOnStop = () => requestController.abort();
+        controller.signal.addEventListener("abort", abortRequestOnStop, {
+          once: true,
+        });
+        let idleTimer = window.setTimeout(
+          () => requestController.abort(),
+          40_000
+        );
+        const hardTimer = window.setTimeout(
+          () => requestController.abort(),
+          50_000
+        );
+        const refreshIdleTimer = () => {
+          window.clearTimeout(idleTimer);
+          idleTimer = window.setTimeout(
+            () => requestController.abort(),
+            40_000
+          );
+        };
+        const cleanupRequest = () => {
+          window.clearTimeout(idleTimer);
+          window.clearTimeout(hardTimer);
+          controller.signal.removeEventListener("abort", abortRequestOnStop);
+        };
         try {
           response = await fetch("/api/gmail/scan", {
             method: "POST",
             headers: { "content-type": "application/json" },
-            body: JSON.stringify({ startDate: currentWindow.start, endDate: currentWindow.end, pageToken, totals }),
-            signal: controller.signal,
+            body: JSON.stringify({ startDate: currentWindow.start, endDate: currentWindow.end, pageToken, pageSize, totals }),
+            signal: requestController.signal,
           });
         } catch (error) {
+          cleanupRequest();
           if (controller.signal.aborted) throw error;
-          if (networkRetryCount >= 5) throw error;
+          if (networkRetryCount >= MAX_NETWORK_RETRIES) throw error;
           networkRetryCount++;
+          pageSize = Math.max(1, Math.floor(pageSize / 2));
           const delay = Math.min(2000 * 2 ** (networkRetryCount - 1), 30000);
           setMessage(
-            `Connection interrupted. Retrying this email batch in ${Math.ceil(
-              delay / 1000
-            )} seconds…`
+            `${requestController.signal.aborted ? "Batch timed out or stopped sending progress" : "Connection interrupted"}. Retrying with ${pageSize} email${pageSize === 1 ? "" : "s"} after ${Math.ceil(delay / 1000)} seconds…`
           );
           await waitForRetry(delay, controller.signal);
           continue;
@@ -332,10 +360,12 @@ export default function GmailScanPanel({
         if (!response.ok) {
           if (
             [500, 502, 503, 504].includes(response.status) &&
-            networkRetryCount < 5
+            networkRetryCount < MAX_NETWORK_RETRIES
           ) {
             networkRetryCount++;
+            pageSize = Math.max(1, Math.floor(pageSize / 2));
             const delay = Math.min(2000 * 2 ** (networkRetryCount - 1), 30000);
+            cleanupRequest();
             setMessage(
               `Vercel interrupted this batch (HTTP ${
                 response.status
@@ -344,13 +374,16 @@ export default function GmailScanPanel({
             await waitForRetry(delay, controller.signal);
             continue;
           }
+          cleanupRequest();
           const error = (await response.json()) as { error?: string };
           throw new Error(
             error.error ?? `Could not scan Gmail (HTTP ${response.status}).`
           );
         }
-        if (!response.body)
+        if (!response.body) {
+          cleanupRequest();
           throw new Error("This browser cannot receive live scan progress.");
+        }
         const reader = response.body.getReader(),
           decoder = new TextDecoder();
         let buffer = "",
@@ -359,7 +392,7 @@ export default function GmailScanPanel({
           shouldRetryQuota = false,
           shouldRetryNetwork = false;
         const batchFiles: Array<{ file: File; event: ScanEvent }> = [];
-        const updateFromEvent = (event: ScanEvent) => {
+        const updateFromEvent = () => {
           setStats((s) => ({ ...s, ...totals, currentFile: s.currentFile }));
         };
         const markEmail = (event: ScanEvent, failed = false) => {
@@ -391,11 +424,11 @@ export default function GmailScanPanel({
                 windowEstimateCounted = true;
               }
             }
-            updateFromEvent(event);
+            updateFromEvent();
           }
           if (name === "progress") {
             markEmail(event);
-            updateFromEvent(event);
+            updateFromEvent();
           }
           if (name === "skipped") {
             const skipId = `${String(event.messageId ?? "mail")}:${String(
@@ -417,11 +450,11 @@ export default function GmailScanPanel({
               reason: String(event.reason ?? "Not parsed automatically."),
             };
             setReviewItems((items) => [...items, item]);
-            updateFromEvent(event);
+            updateFromEvent();
           }
           if (name === "email_failed") {
             markEmail(event, true);
-            updateFromEvent(event);
+            updateFromEvent();
             const messageId = String(event.messageId ?? "");
             setReviewItems((items) => [
               ...items,
@@ -470,7 +503,7 @@ export default function GmailScanPanel({
             setMessage(`Found ${filename}; queued for candidate extraction…`);
           }
           if (name === "batch") {
-            updateFromEvent(event);
+            updateFromEvent();
             pageToken =
               typeof event.nextPageToken === "string"
                 ? event.nextPageToken
@@ -480,12 +513,14 @@ export default function GmailScanPanel({
                 "Gmail did not return a continuation token for the next batch.";
             quotaRetryCount = 0;
             networkRetryCount = 0;
+            pageSize = Math.min(DEFAULT_EMAILS_PER_BATCH, pageSize + 1);
             terminalEvent = true;
           }
           if (name === "complete") {
-            updateFromEvent(event);
+            updateFromEvent();
             pageToken = undefined;
             networkRetryCount = 0;
+            pageSize = Math.min(DEFAULT_EMAILS_PER_BATCH, pageSize + 1);
             if (windowIndex === windows.length - 1) {
               complete = true;
             } else {
@@ -500,7 +535,7 @@ export default function GmailScanPanel({
             terminalEvent = true;
           }
           if (name === "error") {
-            updateFromEvent(event);
+            updateFromEvent();
             batchError = String(event.message ?? "Gmail scan failed.");
             shouldRetryQuota =
               /rateLimitExceeded|userRateLimitExceeded|quotaExceeded/i.test(
@@ -513,6 +548,7 @@ export default function GmailScanPanel({
           while (true) {
             const { value, done } = await reader.read();
             if (done) break;
+            if (value?.byteLength) refreshIdleTimer();
             buffer += decoder.decode(value, { stream: true });
             let boundary = buffer.indexOf("\n\n");
             while (boundary >= 0) {
@@ -527,6 +563,7 @@ export default function GmailScanPanel({
           shouldRetryNetwork = true;
         } finally {
           reader.releaseLock();
+          cleanupRequest();
         }
         if (!terminalEvent && !batchError && !shouldRetryQuota)
           shouldRetryNetwork = true;
@@ -549,15 +586,14 @@ export default function GmailScanPanel({
         }
         if (shouldRetryNetwork) {
           networkRetryCount++;
-          if (networkRetryCount > 5)
+          if (networkRetryCount > MAX_NETWORK_RETRIES)
             throw new Error(
               "The connection to Gmail kept dropping. The completed batches are preserved; start another scan to continue."
             );
           const delay = Math.min(2000 * 2 ** (networkRetryCount - 1), 30000);
+          pageSize = Math.max(1, Math.floor(pageSize / 2));
           setMessage(
-            `Connection interrupted. Retrying this email batch in ${Math.ceil(
-              delay / 1000
-            )} seconds…`
+            `Connection interrupted. Retrying this email batch with ${pageSize} email${pageSize === 1 ? "" : "s"} after ${Math.ceil(delay / 1000)} seconds…`
           );
           await waitForRetry(delay, controller.signal);
           continue;
@@ -929,11 +965,11 @@ export default function GmailScanPanel({
                 </b>
               </div>
               <div>
-                <small>Resume documents found</small>
+                <small>PDF/DOCX files found</small>
                 <b>{stats.documentsFound.toLocaleString()}</b>
               </div>
               <div>
-                <small>Documents parsed</small>
+                <small>Resumes extracted</small>
                 <b>{stats.documentsParsed.toLocaleString()}</b>
               </div>
               <div>
@@ -977,6 +1013,45 @@ export default function GmailScanPanel({
               </div>
             )}
           </div>
+        )}
+        {stats.phase === "complete" && (
+          <section className="scan-summary" aria-label="Completed scan summary">
+            <div className="scan-summary-heading">
+              <div>
+                <span>SCAN SUMMARY</span>
+                <h3>Mailbox scan complete</h3>
+              </div>
+              <small>
+                {startDate} — {endDate}
+              </small>
+            </div>
+            <div className="scan-summary-grid">
+              <article>
+                <small>Emails scanned</small>
+                <b>{stats.emailsScanned.toLocaleString()}</b>
+              </article>
+              <article>
+                <small>Resume files found</small>
+                <b>{stats.documentsFound.toLocaleString()}</b>
+              </article>
+              <article>
+                <small>Candidate profiles extracted</small>
+                <b>{stats.documentsParsed.toLocaleString()}</b>
+              </article>
+              <article>
+                <small>Not counted as resumes</small>
+                <b>
+                  {(
+                    stats.documentsFailed + stats.skippedAttachments
+                  ).toLocaleString()}
+                </b>
+              </article>
+              <article className={longFiles.length ? "pending" : "settled"}>
+                <small>Long documents waiting for retry</small>
+                <b>{longFiles.length.toLocaleString()}</b>
+              </article>
+            </div>
+          </section>
         )}
         <div
           className={`gmail-message ${

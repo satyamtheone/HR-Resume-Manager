@@ -135,6 +135,7 @@ export async function POST(request: Request) {
     startDate?: string;
     endDate?: string;
     pageToken?: string;
+    pageSize?: number;
     totals?: ScanTotals;
   };
   try {
@@ -151,6 +152,11 @@ export async function POST(request: Request) {
       { error: "Invalid Gmail scan cursor." },
       { status: 400 }
     );
+  if (
+    body.pageSize !== undefined &&
+    (!Number.isInteger(body.pageSize) || body.pageSize < 1 || body.pageSize > 10)
+  )
+    return NextResponse.json({ error: "Invalid Gmail batch size." }, { status: 400 });
   if (
     !startDate ||
     !endDate ||
@@ -219,7 +225,7 @@ export async function POST(request: Request) {
               "https://gmail.googleapis.com/gmail/v1/users/me/messages"
             );
             url.searchParams.set("q", query);
-            url.searchParams.set("maxResults", String(EMAILS_PER_BATCH));
+            url.searchParams.set("maxResults", String(body.pageSize ?? EMAILS_PER_BATCH));
             if (body.pageToken) url.searchParams.set("pageToken", body.pageToken);
             const response = await fetchGmail(
               url,
