@@ -507,7 +507,9 @@ export default function Home() {
           </button>
         </div>
         <GmailScanPanel
-          onFiles={(files) => process(files)}
+          onFiles={(files, signal, timeoutMs) =>
+            process(files, signal, timeoutMs)
+          }
           onScanStateChange={setGmailScanning}
         />
 

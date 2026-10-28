@@ -31,6 +31,8 @@ type ScanStats = {
   failedEmails: number;
   skippedAttachments: number;
   currentFile: string;
+  dateWindow: string;
+  rangeProgress: number;
 };
 type ParseResult = { parsed: number; failed: number; errors?: string[] };
 type ScanEvent = Record<string, unknown>;
@@ -55,12 +57,31 @@ const initialStats: ScanStats = {
   failedEmails: 0,
   skippedAttachments: 0,
   currentFile: "",
+  dateWindow: "",
+  rangeProgress: 0,
 };
 function dateValue(date: Date) {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(
     2,
     "0"
   )}-${String(date.getDate()).padStart(2, "0")}`;
+}
+function dateWindows(start: string, end: string, days = 5) {
+  const windows: Array<{ start: string; end: string }> = [];
+  const finalDay = new Date(`${end}T00:00:00Z`);
+  let cursor = new Date(`${start}T00:00:00Z`);
+  while (cursor <= finalDay) {
+    const windowEnd = new Date(cursor);
+    windowEnd.setUTCDate(windowEnd.getUTCDate() + days - 1);
+    if (windowEnd > finalDay) windowEnd.setTime(finalDay.getTime());
+    windows.push({
+      start: cursor.toISOString().slice(0, 10),
+      end: windowEnd.toISOString().slice(0, 10),
+    });
+    cursor = new Date(windowEnd);
+    cursor.setUTCDate(cursor.getUTCDate() + 1);
+  }
+  return windows;
 }
 function waitForRetry(milliseconds: number, signal: AbortSignal) {
   return new Promise<void>((resolve, reject) => {
@@ -227,8 +248,8 @@ export default function GmailScanPanel({
         const item = pendingParses.shift()!;
         parserWorkers++;
         notifyParserWaiter();
-        let task: Promise<void>;
-        task = parseDiscovered(item)
+        const task = Promise.resolve()
+          .then(() => parseDiscovered(item))
           .catch((error) => {
             const filename = item.file.name;
             totals.documentsFailed++;
@@ -267,18 +288,32 @@ export default function GmailScanPanel({
         await waitForParserChange();
       }
     };
-    let pageToken: string | undefined,
+    const windows = dateWindows(startDate, endDate);
+    let windowIndex = 0,
+      windowEstimateCounted = false,
+      announcedWindowIndex = -1,
+      pageToken: string | undefined,
       complete = false,
       quotaRetryCount = 0,
       networkRetryCount = 0;
     try {
-      while (!complete && !controller.signal.aborted) {
+      while (windowIndex < windows.length && !complete && !controller.signal.aborted) {
+        const currentWindow = windows[windowIndex];
+        if (announcedWindowIndex !== windowIndex) {
+          announcedWindowIndex = windowIndex;
+          setStats((s) => ({
+            ...s,
+            dateWindow: `Window ${windowIndex + 1} of ${windows.length} · ${currentWindow.start}–${currentWindow.end}`,
+            rangeProgress: Math.min(99, Math.round((windowIndex / windows.length) * 100)),
+          }));
+          setMessage(`Scanning five-day window ${windowIndex + 1} of ${windows.length}: ${currentWindow.start} to ${currentWindow.end}.`);
+        }
         let response: Response;
         try {
           response = await fetch("/api/gmail/scan", {
             method: "POST",
             headers: { "content-type": "application/json" },
-            body: JSON.stringify({ startDate, endDate, pageToken, totals }),
+            body: JSON.stringify({ startDate: currentWindow.start, endDate: currentWindow.end, pageToken, totals }),
             signal: controller.signal,
           });
         } catch (error) {
@@ -325,8 +360,6 @@ export default function GmailScanPanel({
           shouldRetryNetwork = false;
         const batchFiles: Array<{ file: File; event: ScanEvent }> = [];
         const updateFromEvent = (event: ScanEvent) => {
-          const estimate = Number(event.totalEmailsEstimate);
-          if (Number.isFinite(estimate)) totals.totalEmailsEstimate = estimate;
           setStats((s) => ({ ...s, ...totals, currentFile: s.currentFile }));
         };
         const markEmail = (event: ScanEvent, failed = false) => {
@@ -351,13 +384,14 @@ export default function GmailScanPanel({
           if (!name || !data) return;
           const event = JSON.parse(data) as ScanEvent;
           if (name === "start") {
+            if (!windowEstimateCounted) {
+              const windowEstimate = Number(event.windowEmailsEstimate);
+              if (Number.isFinite(windowEstimate)) {
+                totals.totalEmailsEstimate = (totals.totalEmailsEstimate ?? 0) + windowEstimate;
+                windowEstimateCounted = true;
+              }
+            }
             updateFromEvent(event);
-            if (totals.emailsScanned === 0)
-              setMessage(
-                `Found about ${(
-                  totals.totalEmailsEstimate ?? 0
-                ).toLocaleString()} matching emails. Starting the scan…`
-              );
           }
           if (name === "progress") {
             markEmail(event);
@@ -451,7 +485,18 @@ export default function GmailScanPanel({
           if (name === "complete") {
             updateFromEvent(event);
             pageToken = undefined;
-            complete = true;
+            networkRetryCount = 0;
+            if (windowIndex === windows.length - 1) {
+              complete = true;
+            } else {
+              windowIndex++;
+              windowEstimateCounted = false;
+              setStats((s) => ({
+                ...s,
+                dateWindow: `Window ${windowIndex + 1} of ${windows.length} · ${windows[windowIndex].start}–${windows[windowIndex].end}`,
+                rangeProgress: Math.min(99, Math.round((windowIndex / windows.length) * 100)),
+              }));
+            }
             terminalEvent = true;
           }
           if (name === "error") {
@@ -531,6 +576,7 @@ export default function GmailScanPanel({
           ...totals,
           phase: "complete",
           currentFile: "",
+          rangeProgress: 100,
         }));
         setMessage(
           `Scan complete. ${totals.documentsFound.toLocaleString()} resume documents found; ${totals.emailsScanned.toLocaleString()} emails checked.${
@@ -657,12 +703,7 @@ export default function GmailScanPanel({
   const emailPercent =
     stats.phase === "complete" || stats.phase === "retrying"
       ? 100
-      : stats.totalEmailsEstimate
-      ? Math.min(
-          99,
-          Math.round((stats.emailsScanned / stats.totalEmailsEstimate) * 100)
-        )
-      : 0;
+      : stats.rangeProgress;
   const docsPending = Math.max(
     0,
     stats.documentsFound - stats.documentsParsed - stats.documentsFailed
@@ -854,9 +895,9 @@ export default function GmailScanPanel({
                 </b>
               </div>
               <span>
-                {stats.totalEmailsEstimate === null
-                  ? "Counting matching emails…"
-                  : `${stats.emailsScanned.toLocaleString()} / ~${stats.totalEmailsEstimate.toLocaleString()} emails checked`}
+                {stats.phase === "complete"
+                  ? `${stats.emailsScanned.toLocaleString()} emails checked across the selected range`
+                  : `${stats.emailsScanned.toLocaleString()} checked · ${stats.dateWindow || "Counting matching emails…"}`}
               </span>
             </div>
             <div className="scan-track">
@@ -872,13 +913,13 @@ export default function GmailScanPanel({
                   {stats.emailsScanned.toLocaleString()}
                   <em>
                     {stats.totalEmailsEstimate !== null
-                      ? ` / ~${stats.totalEmailsEstimate.toLocaleString()}`
+                      ? ` · ~${stats.totalEmailsEstimate.toLocaleString()} estimated in searched windows`
                       : ""}
                   </em>
                 </b>
               </div>
               <div>
-                <small>Emails remaining</small>
+                <small>{stats.phase === "complete" ? "Emails remaining" : "Known remaining"}</small>
                 <b>
                   {emailsRemaining === null
                     ? "…"
